@@ -118,6 +118,11 @@ def startup_event():
     load_policy_into_docs()
 
 
+@app.get("/")
+def root():
+    return {"message": "RAG Chatbot MVP is running. Use POST /v1/chat/answer or visit /docs for Swagger UI."}
+
+
 def get_client():
     os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
@@ -189,6 +194,25 @@ def build_prompt(question: str, docs: List[sqlite3.Row]) -> str:
         "Answer based on the context when possible. If the context is not relevant, answer from your own knowledge."
     )
     return prompt
+
+"""
+---
+THIS IS USED TO TEST LLM WORKS. PLEASE GO TO http://localhost:8000/v1/chat/test
+---
+"""
+# @app.get("/v1/chat/test")
+# def chat_test():
+#     client = get_client()
+#     question = "How many seconds are there in an hour?"
+#     completion = client.chat.completions.create(
+#         model="gpt-4o-mini",
+#         messages=[
+#             {"role": "system", "content": "You are a helpful assistant."},
+#             {"role": "user", "content": question},
+#         ],
+#     )
+#     answer = completion.choices[0].message.content
+#     return {"test_question": question, "answer": answer}
 
 
 @app.post("/v1/chat/answer", response_model=ChatResponse)
