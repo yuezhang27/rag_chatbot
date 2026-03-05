@@ -1,5 +1,13 @@
 ## 超小 RAG Chatbot MVP
 
+### 如何使用OpenCode进行vibe coding
+
+- Step1. cmd，执行命令`wsl`
+- Step2. 进入项目文件夹
+- Step3. `opencode`
+
+> 如果opencode不确定怎么弄：https://www.runoob.com/ai-agent/opencode-coding-agent.html
+
 ### 项目结构
 
 - **app.py**: FastAPI 应用入口，包含：
@@ -70,9 +78,7 @@ curl -X POST "http://localhost:8000/v1/chat/answer" ^
   "conversation_id": 1,
   "message_id": 2,
   "answer": "...",
-  "citations": [
-    { "doc_id": 1, "title": "policy", "snippet": "..." }
-  ]
+  "citations": [{ "doc_id": 1, "title": "policy", "snippet": "..." }]
 }
 ```
 
