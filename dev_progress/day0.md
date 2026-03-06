@@ -1,4 +1,4 @@
-# 项目功能总结
+# Day0 实现的功能总结
 
 这是一个 **超小 RAG (Retrieval-Augmented Generation) Chatbot MVP**，实现了以下功能：
 
