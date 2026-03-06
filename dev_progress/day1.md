@@ -72,7 +72,7 @@ citations.append(
 **引导思考：**
 
 > 试着问你的系统："What is the dental coverage?" 然后再问 "Tell me about vision benefits"。  
-> 你会发现，用 `LIKE` 关键词搜索的效果很差——"dental coverage" 搜不到 "teeth cleaning reimbursement" 相关的内容。  
+> 你会发现，用 `LIKE` 或者`OR` 关键词搜索的效果很差——"dental coverage" 搜不到 "teeth cleaning reimbursement" 相关的内容。  
 > **问题**：关键词搜索无法理解语义，同义词、换一种说法就搜不到了。  
 > **这就是为什么我们需要 Vector Search——这是明天要解决的。**
 
@@ -98,8 +98,6 @@ citations.append(
 - **依赖**
   - `requirements.txt` 已增加：`pypdf`、`python-multipart`、`azure-ai-documentintelligence`、`azure-core`。
 
-说明：原来的 `parsepdf.py` 依赖不存在的 `.page`/`.parser`，没有去改它，而是新建了独立的 `pdfparser.py` 供 app 使用。
-
 ---
 
 ## 2. 如何跑起来
@@ -108,7 +106,6 @@ citations.append(
 
 ```bash
 pip install -r requirements.txt
-$env:OPENAI_API_KEY = "你的key"   # PowerShell
 python app.py
 ```
 
@@ -152,3 +149,25 @@ sqlite3 chatbot.db "SELECT id, title, length(chunk) FROM docs;"
 ```
 
 能看到新 PDF 的 `title` 和对应 chunk 即表示“上传 → 解析 → 分块 → 写入 SQLite”全流程已跑通。
+
+--
+Update
+
+**问题**
+
+配置没有问题，查询SQLite发现chunking和储存正常，但是询问Is Github Actions used during Jane Doe\'s experience at ...？的时候，找不到结果
+
+**原因**  
+检索用的是「整句」匹配：
+
+- SQL 是：`WHERE chunk LIKE '%Is Github Actions used during Jane Doe\'s experience at CompanyA？%'`
+- 只有某条 chunk 里**完整包含**这整句话才会命中，而你的 chunk 里只会出现 “Github”“Actions”“Jane”“Doe”“CompanyA” 等词，不会整句一模一样，所以查不到任何一行 → `citations` 为空。
+
+**改动**  
+检索改成「按问题里的关键词」匹配：
+
+1. **从问题里提关键词**：用空格、标点等把问题拆成词，去掉 “is / at / the / 的 / 是” 这类停用词，得到例如 `Github`, `Actions`, `Jane`, `Doe`, `CompanyA`, `experience` 等。
+2. **按「任意关键词」匹配**：`chunk` 里只要包含**任意一个**关键词就命中（多个 `chunk LIKE '%keyword%'` 用 OR 连接）。
+3. **按相关度排序**：对命中的 chunk 按「包含的关键词个数」打分，取分数最高的 `top_k` 条作为检索结果，再交给 LLM 并生成 `citations`。
+
+这样像 “Is Github Actions used during Jane Doe's experience at CompanyA？” 会命中包含 “Github”“Actions”“Jane”“Doe”“CompanyA” 等的 chunk，`citations` 里就会有引用。
