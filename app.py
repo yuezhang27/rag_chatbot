@@ -1,4 +1,5 @@
 import os
+import re
 import sqlite3
 from datetime import datetime
 from typing import List, Optional
@@ -178,21 +179,50 @@ def save_message(conversation_id: int, role: str, content: str) -> int:
     return message_id
 
 
+def _question_to_keywords(question: str) -> List[str]:
+    """Split question into keywords (e.g. 'Kim Zhang SAP' -> ['Kim', 'Zhang', 'SAP'])."""
+    # Split on spaces, punctuation, and common CJK/ASCII delimiters
+    tokens = re.split(r"[\s\?\.,\'\"\-\u3000-\u303f\uff00-\uffef；。，、]+", question)
+    # Keep tokens that look like meaningful words (length >= 2, or single char if alphanumeric and not stopword)
+    stop = {"is", "at", "in", "on", "to", "of", "the", "a", "an", "and", "or", "your", "you", "的", "是", "了", "吗", "什么", "怎么", "如何"}
+    keywords = []
+    for t in tokens:
+        t = t.strip()
+        if not t:
+            continue
+        if len(t) >= 2 and t.lower() not in stop:
+            keywords.append(t)
+        elif len(t) == 1 and t.isalnum() and t.lower() not in {"a", "i"}:
+            keywords.append(t)
+    return keywords[:20]
+
+
 def retrieve_docs(question: str, top_k: int) -> List[sqlite3.Row]:
     conn = get_db_connection()
     cursor = conn.cursor()
-    pattern = f"%{question}%"
+    keywords = _question_to_keywords(question)
+    if not keywords:
+        cursor.execute(
+            "SELECT id, title, chunk FROM docs ORDER BY id DESC LIMIT ?",
+            (top_k,),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+    # Match chunks that contain ANY keyword; fetch more then rank by number of matches
+    placeholders = " OR ".join(["chunk LIKE ?" for _ in keywords])
+    params = [f"%{k}%" for k in keywords]
     cursor.execute(
-        """
-        SELECT id, title, chunk
-        FROM docs
-        WHERE chunk LIKE ? OR title LIKE ?
-        LIMIT ?
-        """,
-        (pattern, pattern, top_k),
+        f"SELECT id, title, chunk FROM docs WHERE {placeholders}",
+        params,
     )
     rows = cursor.fetchall()
     conn.close()
+    # Rank by how many keywords appear in chunk (and title), take top_k
+    def score(row):
+        c, t = (row["chunk"] or "").lower(), (row["title"] or "").lower()
+        return sum(1 for k in keywords if k.lower() in c or k.lower() in t)
+    rows = sorted(rows, key=score, reverse=True)[:top_k]
     return rows
 
 
