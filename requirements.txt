@@ -1,5 +1,9 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.0
 openai==1.52.0
+pypdf>=4.0.0
+python-multipart>=0.0.9
+azure-ai-documentintelligence>=1.0.0
+azure-core>=1.29.0
 
 

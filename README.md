@@ -12,10 +12,12 @@
 
 - **app.py**: FastAPI 应用入口，包含：
   - SQLite 初始化与表结构创建
-  - 启动时读取并切分本地 `policy.txt` 写入 `docs` 表
-  - 单一接口 `POST /v1/chat/answer`
+  - 启动时若 `docs` 为空则读取并切分本地 `policy.txt` 写入 `docs` 表
+  - 单一接口 `POST /v1/chat/answer`、管理员 `POST /admin/documents/upload` 上传 PDF
   - 调用 OpenAI 的 `gpt-4o-mini` 同步生成答案
-- **policy.txt**: 本地示例 policy 文本，启动时会被切成若干 chunk 写入 `docs` 表。
+- **scripts/prepdocs/pdfparser.py**: PDF 文本抽取，支持 `local`（pypdf）与 `azure`（Document Intelligence）。
+- **scripts/prepdocs/textsplitter.py**: 结构感知递归分块（段落→行→句→词），支持 chunk 长度与 overlap，适合保险/内部 PDF RAG。
+- **policy.txt**: 本地示例 policy 文本，启动时若无文档则被切成若干 chunk 写入 `docs` 表。
 - **requirements.txt**: Python 依赖列表。
 - **Dockerfile**: 最简可运行 Docker 镜像配置。
 
@@ -81,5 +83,34 @@ curl -X POST "http://localhost:8000/v1/chat/answer" ^
   "citations": [{ "doc_id": 1, "title": "policy", "snippet": "..." }]
 }
 ```
+
+### 管理员上传 PDF（新增）
+
+上传 PDF 后会自动：解析文本 → 结构感知分块 → 写入 SQLite `docs` 表。无需 worker，同步处理即可。
+
+1. **仅本地解析（默认）**  
+   使用 pypdf，无需额外配置：
+
+```bash
+curl -X POST "http://localhost:8000/admin/documents/upload" ^
+  -F "file=@/path/to/your.pdf"
+```
+
+2. **使用 Azure Document Intelligence**  
+   设置环境变量后，上传时指定 `parser=azure`：
+
+```bash
+$env:DOCINTELLIGENCE_ENDPOINT = "https://xxx.cognitiveservices.azure.com/"
+$env:DOCINTELLIGENCE_KEY = "your_key"
+
+curl -X POST "http://localhost:8000/admin/documents/upload?parser=azure" ^
+  -F "file=@/path/to/your.pdf"
+```
+
+返回示例：`{"filename":"xxx.pdf","title":"xxx","chunks_inserted":12}`
+
+3. **验证上传结果**  
+   - 再调用 `POST /v1/chat/answer`，`question` 里提一个 PDF 中的问题，`use_retrieval: true`，看是否能检索到并回答。  
+   - 或直接查 SQLite：`SELECT id, title, length(chunk) FROM docs;`
 
 # rag_chatbot

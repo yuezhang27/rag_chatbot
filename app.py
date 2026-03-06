@@ -3,9 +3,12 @@ import sqlite3
 from datetime import datetime
 from typing import List, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile
 from pydantic import BaseModel
 from openai import OpenAI
+
+from scripts.prepdocs.pdfparser import parse_pdf
+from scripts.prepdocs.textsplitter import split_text
 
 
 DATABASE_PATH = "chatbot.db"
@@ -86,6 +89,21 @@ def load_policy_into_docs():
 
     conn.commit()
     conn.close()
+
+
+def insert_chunks_into_docs(title: str, chunks: List[str]) -> int:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    now = datetime.utcnow().isoformat()
+    for chunk in chunks:
+        cursor.execute(
+            "INSERT INTO docs (title, chunk, created_at) VALUES (?, ?, ?)",
+            (title, chunk, now),
+        )
+    conn.commit()
+    n = len(chunks)
+    conn.close()
+    return n
 
 
 class ChatRequest(BaseModel):
@@ -194,6 +212,23 @@ def build_prompt(question: str, docs: List[sqlite3.Row]) -> str:
         "Answer based on the context when possible. If the context is not relevant, answer from your own knowledge."
     )
     return prompt
+
+@app.post("/admin/documents/upload")
+def admin_upload_pdf(
+    file: UploadFile = File(...),
+    parser: str = "local",
+):
+    """Upload a PDF: extract text, chunk with structure-aware splitter, store in SQLite. parser: 'local' or 'azure'."""
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        return {"error": "Only PDF files are accepted"}
+    content = file.file.read()
+    file.file.close()
+    title = os.path.splitext(os.path.basename(file.filename))[0] or "document"
+    raw_text = parse_pdf(content, file.filename, backend=parser)
+    chunks = split_text(raw_text, chunk_size=600, chunk_overlap=80)
+    n = insert_chunks_into_docs(title, chunks)
+    return {"filename": file.filename, "title": title, "chunks_inserted": n}
+
 
 """
 ---
