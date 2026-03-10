@@ -48,3 +48,4 @@ chatbot.db
 # Materials
 # =========================
 *.pdf
+data/
