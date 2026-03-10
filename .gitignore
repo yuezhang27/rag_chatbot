@@ -43,3 +43,8 @@ Thumbs.db
 chatbot.db
 *.sqlite
 *.sqlite3
+
+# =========================
+# Materials
+# =========================
+*.pdf
