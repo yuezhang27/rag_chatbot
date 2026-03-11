@@ -43,6 +43,7 @@ Thumbs.db
 chatbot.db
 *.sqlite
 *.sqlite3
+chroma_db/
 
 # =========================
 # Materials

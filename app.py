@@ -2,14 +2,18 @@ import os
 import re
 import sqlite3
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Union
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile
 from pydantic import BaseModel
-from openai import OpenAI
+from openai import AzureOpenAI
 
 from scripts.prepdocs.pdfparser import parse_pdf
 from scripts.prepdocs.textsplitter import split_text
+from scripts.chroma_embed import add_chunks_to_chroma, retrieve_from_chroma
+
+load_dotenv()
 
 
 DATABASE_PATH = "chatbot.db"
@@ -143,9 +147,20 @@ def root():
 
 
 def get_client():
-    os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    return client
+    """Azure OpenAI chat client; config from .env (AZURE_OPENAI_*)."""
+    endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
+    key = os.environ.get("AZURE_OPENAI_API_KEY")
+    if not endpoint or not key:
+        raise ValueError("AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY must be set in .env")
+    return AzureOpenAI(
+        azure_endpoint=endpoint,
+        api_key=key,
+        api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-01"),
+    )
+
+
+def get_chat_deployment() -> str:
+    return os.environ.get("AZURE_OPENAI_CHAT_DEPLOYMENT", "gpt-4o-mini")
 
 
 def create_conversation_if_needed(conversation_id: Optional[int]) -> int:
@@ -226,13 +241,13 @@ def retrieve_docs(question: str, top_k: int) -> List[sqlite3.Row]:
     return rows
 
 
-def build_prompt(question: str, docs: List[sqlite3.Row]) -> str:
+def build_prompt(question: str, docs: List[Union[sqlite3.Row, dict]]) -> str:
     if not docs:
         return f"Answer the user's question clearly.\n\nQuestion: {question}"
-
     context_parts = []
     for i, doc in enumerate(docs, start=1):
-        context_parts.append(f"[Document {i}] {doc['chunk']}")
+        chunk = doc["chunk"] if isinstance(doc, dict) else doc["chunk"]
+        context_parts.append(f"[Document {i}] {chunk}")
     context_text = "\n\n".join(context_parts)
 
     prompt = (
@@ -248,7 +263,7 @@ def admin_upload_pdf(
     file: UploadFile = File(...),
     parser: str = "local",
 ):
-    """Upload a PDF: extract text, chunk with structure-aware splitter, store in SQLite. parser: 'local' or 'azure'."""
+    """Upload a PDF: extract text, chunk, store in SQLite + Chroma (vector). parser: 'local' or 'azure'."""
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         return {"error": "Only PDF files are accepted"}
     content = file.file.read()
@@ -256,8 +271,9 @@ def admin_upload_pdf(
     title = os.path.splitext(os.path.basename(file.filename))[0] or "document"
     raw_text = parse_pdf(content, file.filename, backend=parser)
     chunks = split_text(raw_text, chunk_size=600, chunk_overlap=80)
-    n = insert_chunks_into_docs(title, chunks)
-    return {"filename": file.filename, "title": title, "chunks_inserted": n}
+    n_sqlite = insert_chunks_into_docs(title, chunks)
+    n_chroma = add_chunks_to_chroma(title, chunks)
+    return {"filename": file.filename, "title": title, "chunks_inserted": n_sqlite, "chroma_added": n_chroma}
 
 
 """
@@ -283,38 +299,32 @@ THIS IS USED TO TEST LLM WORKS. PLEASE GO TO http://localhost:8000/v1/chat/test
 @app.post("/v1/chat/answer", response_model=ChatResponse)
 def chat_answer(request: ChatRequest):
     conversation_id = create_conversation_if_needed(request.conversation_id)
+    save_message(conversation_id, "user", request.question)
 
-    user_message_id = save_message(conversation_id, "user", request.question)
-
-    retrieved_rows: List[sqlite3.Row] = []
+    # Vector retrieval: Chroma cosine similarity top-5 (SQLite keyword retrieval kept but not used here)
+    retrieved: List[dict] = []
     if request.use_retrieval:
-        retrieved_rows = retrieve_docs(request.question, request.top_k)
+        retrieved = retrieve_from_chroma(request.question, top_k=5)
 
-    prompt = build_prompt(request.question, retrieved_rows)
+    prompt = build_prompt(request.question, retrieved)
 
     client = get_client()
     completion = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=get_chat_deployment(),
         messages=[
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": prompt},
         ],
     )
     answer = completion.choices[0].message.content
-
     assistant_message_id = save_message(conversation_id, "assistant", answer)
 
     citations: List[Citation] = []
-    for row in retrieved_rows:
-        snippet = row["chunk"]
-        if len(snippet) > 200:
-            snippet = snippet[:200] + "..."
+    for doc in retrieved:
+        chunk = doc["chunk"]
+        snippet = chunk[:200] + "..." if len(chunk) > 200 else chunk
         citations.append(
-            Citation(
-                doc_id=row["id"],
-                title=row["title"],
-                snippet=snippet,
-            )
+            Citation(doc_id=doc["doc_id"], title=doc["title"], snippet=snippet)
         )
 
     return ChatResponse(

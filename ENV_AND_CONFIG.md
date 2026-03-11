@@ -8,12 +8,17 @@
 
 | 变量名 | 用途 | 本地开发是否必填 | 接入 Azure/云服务时 |
 |--------|------|------------------|---------------------|
-| `OPENAI_API_KEY` | 调用 OpenAI 接口（对话/LLM） | **必填** | 必填（或改用 Azure OpenAI 时见下文） |
+| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI 端点（对话 + Embedding） | **必填**（当前已切到 Azure） | 必填 |
+| `AZURE_OPENAI_API_KEY` | Azure OpenAI API 密钥 | **必填** | 必填 |
+| `AZURE_OPENAI_CHAT_DEPLOYMENT` | 对话模型部署名（如 gpt-4o-mini） | 可选，默认 `gpt-4o-mini` | 按实际部署名填写 |
+| `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` | Embedding 模型部署名（如 text-embedding-3-small） | 可选，默认 `text-embedding-3-small` | 按实际部署名填写 |
+| `AZURE_OPENAI_API_VERSION` | API 版本 | 可选，默认 `2024-02-01` | 按需 |
 | `DOCINTELLIGENCE_ENDPOINT` | Azure Document Intelligence 接口地址（PDF 解析） | 不填 | 使用 `parser=azure` 时**必填** |
 | `DOCINTELLIGENCE_KEY` | Azure Document Intelligence 密钥 | 不填 | 使用 `parser=azure` 时**必填** |
 
-- **仅本地开发**：只需配置 `OPENAI_API_KEY`，PDF 上传使用本地解析（pypdf），无需 Azure。
-- **未来接入 Azure**：在需要使用「Azure Document Intelligence」解析 PDF 时，再配置上述两个 Document Intelligence 相关变量，并按照下文步骤完成资源创建与配置。
+- **配置方式**：项目启动时会从**项目根目录的 `.env` 文件**加载上述变量（`python-dotenv`），无需再手动 export。
+- **仅本地开发**：配置好 `AZURE_OPENAI_*` 即可；PDF 上传使用本地解析（pypdf）时无需 Document Intelligence。
+- **向量检索**：已使用 ChromaDB（`./chroma_db`）+ Azure OpenAI Embedding，上传 PDF 时会批量生成向量并写入 Chroma。
 
 ---
 
@@ -122,13 +127,44 @@ curl -X POST "http://localhost:8000/admin/documents/upload?parser=azure" -F "fil
 
 ---
 
-### 3.2 其他可能接入的 Azure 服务（预留）
+### 3.2 Azure OpenAI（对话 + Embedding，当前已使用）
+
+用于 `POST /v1/chat/answer` 的 LLM 对话，以及 PDF 上传后的 chunk 向量化与检索。
+
+#### 步骤 1：在 Azure 创建 OpenAI 资源
+
+1. 打开 [Azure 门户](https://portal.azure.com/) → 搜索「Azure OpenAI」→ 创建资源。  
+2. 选择订阅、资源组、区域、定价层。  
+3. 创建完成后，进入该资源 → **密钥和终结点**：复制 **终结点** 和 **密钥 1**。
+
+#### 步骤 2：部署模型
+
+1. 进入同一 Azure OpenAI 资源 → **模型部署**（或通过 Azure OpenAI Studio）。  
+2. 部署**聊天模型**：部署名例如 `gpt-4o-mini`，模型选 `gpt-4o-mini`。  
+3. 部署 **Embedding 模型**：部署名例如 `text-embedding-3-small`，模型选 `text-embedding-3-small`（或 `text-embedding-ada-002`）。
+
+#### 步骤 3：在项目中配置 .env
+
+在项目根目录创建或编辑 `.env`：
+
+```env
+AZURE_OPENAI_ENDPOINT=https://<your-resource>.openai.azure.com/
+AZURE_OPENAI_API_KEY=你的密钥
+AZURE_OPENAI_CHAT_DEPLOYMENT=gpt-4o-mini
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-3-small
+AZURE_OPENAI_API_VERSION=2024-02-01
+```
+
+重启服务后，对话与 PDF 向量检索会使用上述配置。
+
+---
+
+### 3.3 其他可能接入的 Azure 服务（预留）
 
 若后续增加以下能力，可在此补充对应环境变量与配置步骤，保持本文档为唯一入口：
 
 - **Azure OpenAI**  
-  若将 LLM 从 OpenAI 改为 Azure OpenAI，可能新增：  
-  `AZURE_OPENAI_ENDPOINT`、`AZURE_OPENAI_API_KEY`、`AZURE_OPENAI_DEPLOYMENT_NAME` 等，并在代码中切换调用端点与认证方式。
+  已接入：通过 `AZURE_OPENAI_*` 配置对话与 Embedding，详见上文 3.2。
 
 - **Azure 存储（Blob）**  
   若将上传的 PDF 或生成的文档存到 Blob，可能新增：  
