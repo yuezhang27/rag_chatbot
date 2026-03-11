@@ -6,6 +6,7 @@ from typing import List, Optional, Union
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import AzureOpenAI
 
@@ -132,6 +133,11 @@ class ChatResponse(BaseModel):
     citations: List[Citation]
 
 
+class HistoryMessage(BaseModel):
+    role: str
+    content: str
+
+
 app = FastAPI()
 
 
@@ -144,6 +150,15 @@ def startup_event():
 @app.get("/")
 def root():
     return {"message": "RAG Chatbot MVP is running. Use POST /v1/chat/answer or visit /docs for Swagger UI."}
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def get_client():
@@ -318,15 +333,18 @@ def chat_answer(request: ChatRequest):
     if request.use_retrieval:
         retrieved = retrieve_from_chroma(request.question, top_k=5)
 
+    # Build full message history: optional prior conversation + current question with context
+    history: List[HistoryMessage] = request.conversation_history or []
+    messages: List[dict] = [{"role": "system", "content": "You are a helpful assistant."}]
+    for m in history:
+        messages.append({"role": m.role, "content": m.content})
     prompt = build_prompt(request.question, retrieved)
+    messages.append({"role": "user", "content": prompt})
 
     client = get_client()
     completion = client.chat.completions.create(
         model=get_chat_deployment(),
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": prompt},
-        ],
+        messages=messages,
     )
     answer = completion.choices[0].message.content
     assistant_message_id = save_message(conversation_id, "assistant", answer)
