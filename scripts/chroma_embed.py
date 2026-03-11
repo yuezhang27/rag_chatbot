@@ -3,16 +3,19 @@ ChromaDB persistent store and Azure OpenAI embedding helpers.
 Config from .env: AZURE_OPENAI_*, used for batch embedding and vector search.
 """
 import os
+import time
 from typing import List
 
 from chromadb import PersistentClient
 from chromadb.config import Settings
 from openai import AzureOpenAI
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_fixed
 
 
 CHROMA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "chroma_db")
 COLLECTION_NAME = "documents"
-EMBED_BATCH_SIZE = 50
+EMBED_BATCH_SIZE = 16
+EMBED_BATCH_SLEEP_SEC = 1
 
 
 def _get_azure_openai_client() -> AzureOpenAI:
@@ -31,8 +34,24 @@ def get_embedding_deployment() -> str:
     return os.environ.get("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-small")
 
 
+def _is_429(e: BaseException) -> bool:
+    return getattr(e, "status_code", None) == 429 or getattr(
+        getattr(e, "response", None), "status_code", None
+    ) == 429
+
+
+@retry(
+    retry=retry_if_exception(_is_429),
+    wait=wait_fixed(60),
+    stop=stop_after_attempt(3),
+)
+def _embed_one_batch(client: AzureOpenAI, deployment: str, batch: List[str]) -> List[List[float]]:
+    resp = client.embeddings.create(model=deployment, input=batch)
+    return [d.embedding for d in resp.data]
+
+
 def embed_texts_batch(texts: List[str]) -> List[List[float]]:
-    """Call Azure OpenAI Embedding API in batches. Returns list of embedding vectors."""
+    """Call Azure OpenAI Embedding API in batches (max 16 per batch, 1s sleep between). 429 → wait 60s, max 3 retries."""
     if not texts:
         return []
     client = _get_azure_openai_client()
@@ -40,9 +59,9 @@ def embed_texts_batch(texts: List[str]) -> List[List[float]]:
     all_embeddings: List[List[float]] = []
     for i in range(0, len(texts), EMBED_BATCH_SIZE):
         batch = texts[i : i + EMBED_BATCH_SIZE]
-        resp = client.embeddings.create(model=deployment, input=batch)
-        for d in resp.data:
-            all_embeddings.append(d.embedding)
+        all_embeddings.extend(_embed_one_batch(client, deployment, batch))
+        if i + EMBED_BATCH_SIZE < len(texts):
+            time.sleep(EMBED_BATCH_SLEEP_SEC)
     return all_embeddings
 
 

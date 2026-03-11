@@ -273,7 +273,19 @@ def admin_upload_pdf(
     chunks = split_text(raw_text, chunk_size=600, chunk_overlap=80)
     n_sqlite = insert_chunks_into_docs(title, chunks)
     n_chroma = add_chunks_to_chroma(title, chunks)
-    return {"filename": file.filename, "title": title, "chunks_inserted": n_sqlite, "chroma_added": n_chroma}
+    out = {
+        "filename": file.filename,
+        "title": title,
+        "chunks_inserted": n_sqlite,
+        "chroma_added": n_chroma,
+    }
+    if len(chunks) == 0:
+        out["raw_text_length"] = len(raw_text)
+        out["message"] = (
+            "No text extracted from PDF (raw_text_length=0). 0 chunks stored. "
+            "If the PDF is image-only or scanned, use parser=azure."
+        )
+    return out
 
 
 """
