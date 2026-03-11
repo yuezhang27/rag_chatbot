@@ -23,10 +23,14 @@
 ```
 
 ```text
+我当前的实现方式是，在app.py的admin_upload_pdf函数里，会调用scripts/textsplitter.py里的split_text函数，把上传的文件拆成chunks。然后，app.py里的insert_chunks_into_docs，会把chunks直接存入数据库
 
-2. 修改 `prepdocs.py`：对每个 chunk 调用 Azure OpenAI Embedding API → 拿到向量
-3. 引入 ChromaDB（本地向量数据库），将 chunk 文本 + 向量存入 ChromaDB
-4. 修改检索逻辑：用户提问 → 把问题也转为向量 → 在 ChromaDB 中做 cosine similarity 搜索 → 返回最相关的 top-K chunks
+现在，我希望，在scripts文件夹下面，
+
+1. 修改：对每个 chunk， 调用 Azure OpenAI Embedding API → 拿到向量. 这里涉及到Azure资源相关的配置，请阅读.env文件
+2. 引入 ChromaDB（本地向量数据库），将 chunk 文本 + 向量存入 ChromaDB
+3. 修改检索逻辑：用户提问 → 把问题也转为向量 → 在 ChromaDB 中做 cosine similarity 搜索 → 返回最相关的 top-K chunks
+4. 把 LLM 也切到 Azure OpenAI（`gpt-4o-mini`）。
 ```
 
 **引导思考：**

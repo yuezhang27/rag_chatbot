@@ -62,34 +62,34 @@ def init_db():
     conn.close()
 
 
-def load_policy_into_docs():
-    if not os.path.exists(POLICY_FILE):
-        return
+# def load_policy_into_docs():
+#     if not os.path.exists(POLICY_FILE):
+#         return
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
+#     conn = get_db_connection()
+#     cursor = conn.cursor()
 
-    cursor.execute("SELECT COUNT(*) AS count FROM docs")
-    row = cursor.fetchone()
-    if row and row["count"] > 0:
-        conn.close()
-        return
+#     cursor.execute("SELECT COUNT(*) AS count FROM docs")
+#     row = cursor.fetchone()
+#     if row and row["count"] > 0:
+#         conn.close()
+#         return
 
-    with open(POLICY_FILE, "r", encoding="utf-8") as f:
-        text = f.read()
+#     with open(POLICY_FILE, "r", encoding="utf-8") as f:
+#         text = f.read()
 
-    chunk_size = 400
-    chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size) if text[i : i + chunk_size].strip()]
-    now = datetime.utcnow().isoformat()
+#     chunk_size = 400
+#     chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size) if text[i : i + chunk_size].strip()]
+#     now = datetime.utcnow().isoformat()
 
-    for chunk in chunks:
-        cursor.execute(
-            "INSERT INTO docs (title, chunk, created_at) VALUES (?, ?, ?)",
-            ("policy", chunk, now),
-        )
+#     for chunk in chunks:
+#         cursor.execute(
+#             "INSERT INTO docs (title, chunk, created_at) VALUES (?, ?, ?)",
+#             ("policy", chunk, now),
+#         )
 
-    conn.commit()
-    conn.close()
+#     conn.commit()
+#     conn.close()
 
 
 def insert_chunks_into_docs(title: str, chunks: List[str]) -> int:
@@ -134,7 +134,7 @@ app = FastAPI()
 @app.on_event("startup")
 def startup_event():
     init_db()
-    load_policy_into_docs()
+    # load_policy_into_docs()
 
 
 @app.get("/")
