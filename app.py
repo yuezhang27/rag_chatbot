@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import sqlite3
@@ -7,6 +8,7 @@ from typing import List, Optional, Union
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from openai import AzureOpenAI
 
@@ -124,6 +126,12 @@ class ChatRequest(BaseModel):
     use_retrieval: bool = True
     top_k: int = 3
     conversation_history: Optional[List[HistoryMessage]] = None
+
+
+class AskRequest(BaseModel):
+    question: str
+    use_retrieval: bool = True
+    top_k: int = 3
 
 
 class Citation(BaseModel):
@@ -274,6 +282,20 @@ def build_prompt(question: str, docs: List[Union[sqlite3.Row, dict]]) -> str:
     )
     return prompt
 
+
+def _build_citations_from_retrieved(retrieved: List[dict]) -> List[Citation]:
+    citations: List[Citation] = []
+    for doc in retrieved:
+        chunk = doc["chunk"]
+        snippet = chunk[:200] + "..." if len(chunk) > 200 else chunk
+        citations.append(Citation(doc_id=doc["doc_id"], title=doc["title"], snippet=snippet))
+    return citations
+
+
+def _sse_event(event: str, data: dict) -> bytes:
+    payload = json.dumps(data, ensure_ascii=False)
+    return f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
+
 @app.post("/admin/documents/upload")
 def admin_upload_pdf(
     file: UploadFile = File(...),
@@ -350,13 +372,7 @@ def chat_answer(request: ChatRequest):
     answer = completion.choices[0].message.content
     assistant_message_id = save_message(conversation_id, "assistant", answer)
 
-    citations: List[Citation] = []
-    for doc in retrieved:
-        chunk = doc["chunk"]
-        snippet = chunk[:200] + "..." if len(chunk) > 200 else chunk
-        citations.append(
-            Citation(doc_id=doc["doc_id"], title=doc["title"], snippet=snippet)
-        )
+    citations = _build_citations_from_retrieved(retrieved)
 
     return ChatResponse(
         conversation_id=conversation_id,
@@ -364,6 +380,117 @@ def chat_answer(request: ChatRequest):
         answer=answer,
         citations=citations,
     )
+
+
+@app.post("/v1/chat/stream")
+def chat_stream(request: ChatRequest):
+    conversation_id = create_conversation_if_needed(request.conversation_id)
+    save_message(conversation_id, "user", request.question)
+
+    retrieved: List[dict] = []
+    if request.use_retrieval:
+        retrieved = retrieve_from_chroma(request.question, top_k=5)
+
+    history: List[HistoryMessage] = request.conversation_history or []
+    messages: List[dict] = [{"role": "system", "content": "You are a helpful assistant."}]
+    for m in history:
+        messages.append({"role": m.role, "content": m.content})
+    prompt = build_prompt(request.question, retrieved)
+    messages.append({"role": "user", "content": prompt})
+
+    client = get_client()
+    stream = client.chat.completions.create(
+        model=get_chat_deployment(),
+        messages=messages,
+        stream=True,
+    )
+
+    def event_generator():
+        # thought_process: send retrieved chunks and prompt once
+        yield _sse_event(
+            "thought_process",
+            {
+                "chunks": retrieved,
+                "prompt": prompt,
+            },
+        )
+
+        answer_parts: List[str] = []
+        for chunk in stream:
+            delta = chunk.choices[0].delta
+            text = getattr(delta, "content", None) or ""
+            if not text:
+                continue
+            answer_parts.append(text)
+            yield _sse_event("token", {"text": text})
+
+        full_answer = "".join(answer_parts)
+        assistant_message_id = save_message(conversation_id, "assistant", full_answer)
+        citations = _build_citations_from_retrieved(retrieved)
+        yield _sse_event(
+            "done",
+            {
+                "conversation_id": conversation_id,
+                "message_id": assistant_message_id,
+                "citations": [c.dict() for c in citations],
+            },
+        )
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@app.post("/v1/ask/stream")
+def ask_stream(request: AskRequest):
+    # Single-turn ask: no conversation history
+    conversation_id = create_conversation_if_needed(None)
+    save_message(conversation_id, "user", request.question)
+
+    retrieved: List[dict] = []
+    if request.use_retrieval:
+        retrieved = retrieve_from_chroma(request.question, top_k=5)
+
+    messages: List[dict] = [{"role": "system", "content": "You are a helpful assistant."}]
+    prompt = build_prompt(request.question, retrieved)
+    messages.append({"role": "user", "content": prompt})
+
+    client = get_client()
+    stream = client.chat.completions.create(
+        model=get_chat_deployment(),
+        messages=messages,
+        stream=True,
+    )
+
+    def event_generator():
+        yield _sse_event(
+            "thought_process",
+            {
+                "chunks": retrieved,
+                "prompt": prompt,
+            },
+        )
+
+        answer_parts: List[str] = []
+        for chunk in stream:
+            delta = chunk.choices[0].delta
+            text = getattr(delta, "content", None) or ""
+            if not text:
+                continue
+            answer_parts.append(text)
+            yield _sse_event("token", {"text": text})
+
+        full_answer = "".join(answer_parts)
+        assistant_message_id = save_message(conversation_id, "assistant", full_answer)
+        citations = _build_citations_from_retrieved(retrieved)
+        yield _sse_event(
+            "done",
+            {
+                "conversation_id": conversation_id,
+                "message_id": assistant_message_id,
+                "citations": [c.dict() for c in citations],
+            },
+        )
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 if __name__ == "__main__":
