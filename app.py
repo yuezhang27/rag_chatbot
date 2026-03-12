@@ -417,6 +417,8 @@ def chat_stream(request: ChatRequest):
 
         answer_parts: List[str] = []
         for chunk in stream:
+            if not chunk.choices:
+                continue
             delta = chunk.choices[0].delta
             text = getattr(delta, "content", None) or ""
             if not text:
@@ -471,6 +473,8 @@ def ask_stream(request: AskRequest):
 
         answer_parts: List[str] = []
         for chunk in stream:
+            if not chunk.choices:
+                continue
             delta = chunk.choices[0].delta
             text = getattr(delta, "content", None) or ""
             if not text:
