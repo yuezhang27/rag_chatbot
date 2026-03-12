@@ -112,12 +112,18 @@ def insert_chunks_into_docs(title: str, chunks: List[str]) -> int:
     return n
 
 
+class HistoryMessage(BaseModel):
+    role: str
+    content: str
+
+
 class ChatRequest(BaseModel):
     conversation_id: Optional[int] = None
     user_id: Optional[str] = None
     question: str
     use_retrieval: bool = True
     top_k: int = 3
+    conversation_history: Optional[List[HistoryMessage]] = None
 
 
 class Citation(BaseModel):
@@ -131,11 +137,6 @@ class ChatResponse(BaseModel):
     message_id: int
     answer: str
     citations: List[Citation]
-
-
-class HistoryMessage(BaseModel):
-    role: str
-    content: str
 
 
 app = FastAPI()
