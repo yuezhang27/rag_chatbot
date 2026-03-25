@@ -3,20 +3,8 @@ import React, { useState } from "react";
 type Role = "user" | "assistant";
 
 interface Citation {
-  doc_id: number;
-  title: string;
-  snippet: string;
-}
-
-interface RetrievedChunk {
-  doc_id: number;
-  title: string;
-  chunk: string;
-}
-
-interface ThoughtProcess {
-  chunks: RetrievedChunk[];
-  prompt: string;
+  filename: string;
+  page: number;
 }
 
 interface Message {
@@ -24,7 +12,11 @@ interface Message {
   role: Role;
   content: string;
   citations?: Citation[];
-  thoughtProcess?: ThoughtProcess;
+
+  // 保留旧字段注释，不直接删除：
+  // 原本对应调试需求（展示 thought_process: prompt + retrieved chunks）。
+  // 现在按 PRD 已移出用户功能范围，保留注释供后续回看演进。
+  // thoughtProcess?: ThoughtProcess;
 }
 
 const API_BASE = "http://localhost:8000";
@@ -32,9 +24,9 @@ const API_BASE = "http://localhost:8000";
 async function streamSSE(
   url: string,
   body: any,
-  onThought: (tp: ThoughtProcess) => void,
+  onCitation: (citations: Citation[]) => void,
   onToken: (text: string) => void,
-  onDone: (data: { citations: Citation[] }) => void
+  onDone: (data: { conversation_id?: string }) => void
 ) {
   const res = await fetch(url, {
     method: "POST",
@@ -45,17 +37,21 @@ async function streamSSE(
     const text = await res.text();
     throw new Error(text || `HTTP ${res.status}`);
   }
+
   const reader = res.body.getReader();
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
+
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
+
     buffer += decoder.decode(value, { stream: true });
     let sepIndex;
     while ((sepIndex = buffer.indexOf("\n\n")) !== -1) {
       const rawEvent = buffer.slice(0, sepIndex);
       buffer = buffer.slice(sepIndex + 2);
+
       const lines = rawEvent.split("\n");
       let event: string | null = null;
       let data: string | null = null;
@@ -67,14 +63,19 @@ async function streamSSE(
         }
       }
       if (!event || !data) continue;
+
       const payload = JSON.parse(data);
-      if (event === "thought_process") {
-        onThought(payload as ThoughtProcess);
-      } else if (event === "token") {
+      if (event === "citation_data") {
+        onCitation(payload.citations || []);
+      } else if (event === "response_text") {
         onToken(payload.text || "");
       } else if (event === "done") {
-        onDone({ citations: payload.citations || [] });
+        onDone({ conversation_id: payload.conversation_id });
       }
+
+      // 旧协议保留注释，不直接删除：
+      // if (event === "thought_process") { ... }
+      // else if (event === "token") { ... }
     }
   }
 }
@@ -84,7 +85,7 @@ const ChatPage: React.FC = () => {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [conversationId, setConversationId] = useState<string | null>(null);
 
   const sendMessage = async () => {
     const trimmed = input.trim();
@@ -96,6 +97,7 @@ const ChatPage: React.FC = () => {
       role: "user",
       content: trimmed,
     };
+
     const history = messages.map((m) => ({
       role: m.role,
       content: m.content,
@@ -111,14 +113,15 @@ const ChatPage: React.FC = () => {
       await streamSSE(
         `${API_BASE}/v1/chat/stream`,
         {
-          question: trimmed,
+          conversation_id: conversationId,
+          message: trimmed,
+          history,
           use_retrieval: true,
-          top_k: 3,
-          conversation_history: history,
+          top_k: 5,
         },
-        (tp) => {
+        (citations) => {
           setMessages((prev) =>
-            prev.map((m) => (m.id === assistantId ? { ...m, thoughtProcess: tp } : m))
+            prev.map((m) => (m.id === assistantId ? { ...m, citations } : m))
           );
         },
         (text) => {
@@ -129,10 +132,10 @@ const ChatPage: React.FC = () => {
             )
           );
         },
-        ({ citations }) => {
-          setMessages((prev) =>
-            prev.map((m) => (m.id === assistantId ? { ...m, citations } : m))
-          );
+        ({ conversation_id }) => {
+          if (conversation_id) {
+            setConversationId(conversation_id);
+          }
         }
       );
     } catch (e: any) {
@@ -158,60 +161,35 @@ const ChatPage: React.FC = () => {
             <div key={m.id} className={`message-row ${m.role}`}>
               <div className="bubble">
                 <div className="content">{m.content}</div>
-                {m.role === "assistant" && (
-                  <>
-                    {m.citations && m.citations.length > 0 && (
-                      <div className="citations">
-                        <details>
-                          <summary>Citations ({m.citations.length})</summary>
-                          <ul>
-                            {m.citations.map((c) => (
-                              <li key={c.doc_id}>
-                                <strong>{c.title}</strong>: {c.snippet}
-                              </li>
-                            ))}
-                          </ul>
-                        </details>
-                      </div>
-                    )}
-                    {m.thoughtProcess && (
-                      <button
-                        className="thought-btn"
-                        onClick={() =>
-                          setExpandedId((prev) => (prev === m.id ? null : m.id))
-                        }
-                      >
-                        {expandedId === m.id ? "隐藏思考过程" : "查看思考过程"}
-                      </button>
-                    )}
-                    {m.thoughtProcess && expandedId === m.id && (
-                      <div className="thought-panel">
-                        <div className="thought-section">
-                          <h4>Prompt</h4>
-                          <pre>{m.thoughtProcess.prompt}</pre>
-                        </div>
-                        <div className="thought-section">
-                          <h4>Retrieved Chunks</h4>
-                          <ul>
-                            {m.thoughtProcess.chunks.map((c) => (
-                              <li key={c.doc_id}>
-                                <strong>{c.title}</strong>:{" "}
-                                {c.chunk.length > 200 ? c.chunk.slice(0, 200) + "..." : c.chunk}
-                              </li>
-                            ))}
-                          </ul>
-                        </div>
-                      </div>
-                    )}
-                  </>
+                {m.role === "assistant" && m.citations && m.citations.length > 0 && (
+                  <div className="citations">
+                    <details>
+                      <summary>Citations ({m.citations.length})</summary>
+                      <ul>
+                        {m.citations.map((c, index) => (
+                          <li key={`${c.filename}-${c.page}-${index}`}>
+                            <strong>{c.filename}</strong> · 第 {c.page} 页
+                          </li>
+                        ))}
+                      </ul>
+                    </details>
+                  </div>
                 )}
+
+                {/*
+                  保留旧 UI（注释不删除）：
+                  原本用于展示 thought_process 调试信息。
+                  现在按 PRD“移除 Thought Process 面板”的范围收敛。
+                */}
               </div>
             </div>
           ))}
+
           {messages.length === 0 && (
-            <div className="placeholder">上传 PDF 后，在这里提问以查看带引用的回答。</div>
+            <div className="placeholder">多轮对话模式：上下文在前端维护，刷新后清空。</div>
           )}
         </div>
+
         <div className="input-area">
           <textarea
             value={input}
@@ -234,7 +212,6 @@ const AskPage: React.FC = () => {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [expandedId, setExpandedId] = useState<string | null>(null);
 
   const send = async () => {
     const trimmed = input.trim();
@@ -253,16 +230,18 @@ const AskPage: React.FC = () => {
     setLoading(true);
 
     try {
+      // Ask = history 为空的 Chat，统一走同一后端接口（ADR 决策）
       await streamSSE(
-        `${API_BASE}/v1/ask/stream`,
+        `${API_BASE}/v1/chat/stream`,
         {
-          question: trimmed,
+          message: trimmed,
+          history: [],
           use_retrieval: true,
-          top_k: 3,
+          top_k: 5,
         },
-        (tp) => {
+        (citations) => {
           setMessages((prev) =>
-            prev.map((m) => (m.id === assistantId ? { ...m, thoughtProcess: tp } : m))
+            prev.map((m) => (m.id === assistantId ? { ...m, citations } : m))
           );
         },
         (text) => {
@@ -273,10 +252,8 @@ const AskPage: React.FC = () => {
             )
           );
         },
-        ({ citations }) => {
-          setMessages((prev) =>
-            prev.map((m) => (m.id === assistantId ? { ...m, citations } : m))
-          );
+        () => {
+          // Ask 模式不保留上下文，不使用 conversation_id。
         }
       );
     } catch (e: any) {
@@ -302,59 +279,24 @@ const AskPage: React.FC = () => {
             <div key={m.id} className={`message-row ${m.role}`}>
               <div className="bubble">
                 <div className="content">{m.content}</div>
-                {m.role === "assistant" && (
-                  <>
-                    {m.citations && m.citations.length > 0 && (
-                      <div className="citations">
-                        <details>
-                          <summary>Citations ({m.citations.length})</summary>
-                          <ul>
-                            {m.citations.map((c) => (
-                              <li key={c.doc_id}>
-                                <strong>{c.title}</strong>: {c.snippet}
-                              </li>
-                            ))}
-                          </ul>
-                        </details>
-                      </div>
-                    )}
-                    {m.thoughtProcess && (
-                      <button
-                        className="thought-btn"
-                        onClick={() =>
-                          setExpandedId((prev) => (prev === m.id ? null : m.id))
-                        }
-                      >
-                        {expandedId === m.id ? "隐藏思考过程" : "查看思考过程"}
-                      </button>
-                    )}
-                    {m.thoughtProcess && expandedId === m.id && (
-                      <div className="thought-panel">
-                        <div className="thought-section">
-                          <h4>Prompt</h4>
-                          <pre>{m.thoughtProcess.prompt}</pre>
-                        </div>
-                        <div className="thought-section">
-                          <h4>Retrieved Chunks</h4>
-                          <ul>
-                            {m.thoughtProcess.chunks.map((c) => (
-                              <li key={c.doc_id}>
-                                <strong>{c.title}</strong>:{" "}
-                                {c.chunk.length > 200 ? c.chunk.slice(0, 200) + "..." : c.chunk}
-                              </li>
-                            ))}
-                          </ul>
-                        </div>
-                      </div>
-                    )}
-                  </>
+                {m.role === "assistant" && m.citations && m.citations.length > 0 && (
+                  <div className="citations">
+                    <details>
+                      <summary>Citations ({m.citations.length})</summary>
+                      <ul>
+                        {m.citations.map((c, index) => (
+                          <li key={`${c.filename}-${c.page}-${index}`}>
+                            <strong>{c.filename}</strong> · 第 {c.page} 页
+                          </li>
+                        ))}
+                      </ul>
+                    </details>
+                  </div>
                 )}
               </div>
             </div>
           ))}
-          {messages.length === 0 && (
-            <div className="placeholder">单轮提问，不保留对话历史。</div>
-          )}
+          {messages.length === 0 && <div className="placeholder">单轮提问，不保留对话历史。</div>}
         </div>
         <div className="input-area">
           <textarea
@@ -382,4 +324,3 @@ const App: React.FC = () => {
 };
 
 export default App;
-

@@ -82,14 +82,15 @@ def _recursive_split(
 
 def split_text(
     text: str,
-    chunk_size: int = 600,
+    chunk_size: int = 400,
     chunk_overlap: int = 80,
     separators: List[str] | None = None,
 ) -> List[str]:
     """
     Split text into chunks using structure-aware recursive splitting.
     Suitable for insurance/internal PDF RAG: respects paragraphs, then lines, then sentences.
-    chunk_size / chunk_overlap are in characters (~4 chars ≈ 1 token for mixed CN/EN).
+    chunk_size / chunk_overlap are in characters。
+    注：PRD 写的是 token；当前为了工程简化用字符近似 token，后续可替换为 tokenizer 精确计数。
     """
     if not text or not text.strip():
         return []

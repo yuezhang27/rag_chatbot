@@ -116,6 +116,7 @@ body {
 }
 
 .thought-btn {
+  /* 保留旧样式，不直接删除：对应已下线的 thought_process 调试面板 */
   margin-top: 4px;
   padding: 2px 6px;
   font-size: 12px;
@@ -126,6 +127,7 @@ body {
 }
 
 .thought-panel {
+  /* 保留旧样式，不直接删除：对应已下线的 thought_process 调试面板 */
   margin-top: 6px;
   padding: 6px;
   border-radius: 6px;
@@ -146,5 +148,4 @@ body {
   border-radius: 4px;
   font-size: 11px;
 }
-
 

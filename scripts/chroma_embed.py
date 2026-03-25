@@ -1,10 +1,15 @@
 """
 ChromaDB persistent store and Azure OpenAI embedding helpers.
 Config from .env: AZURE_OPENAI_*, used for batch embedding and vector search.
+
+说明：
+- 当前是 Day2~Day4 的本地检索实现（Chroma 向量检索）
+- Day5 会引入 SearchClient Adapter（Chroma 本地 / Azure AI Search 生产）
 """
 import os
 import time
 from typing import List
+from uuid import uuid4
 
 from chromadb import PersistentClient
 from chromadb.config import Settings
@@ -14,7 +19,7 @@ from tenacity import retry, retry_if_exception, stop_after_attempt, wait_fixed
 
 CHROMA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "chroma_db")
 COLLECTION_NAME = "documents"
-EMBED_BATCH_SIZE = 16
+EMBED_BATCH_SIZE = 20
 EMBED_BATCH_SLEEP_SEC = 1
 
 
@@ -31,7 +36,8 @@ def _get_azure_openai_client() -> AzureOpenAI:
 
 
 def get_embedding_deployment() -> str:
-    return os.environ.get("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-small")
+    # PRD 对齐：默认使用 text-embedding-ada-002
+    return os.environ.get("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-ada-002")
 
 
 def _is_429(e: BaseException) -> bool:
@@ -51,7 +57,10 @@ def _embed_one_batch(client: AzureOpenAI, deployment: str, batch: List[str]) -> 
 
 
 def embed_texts_batch(texts: List[str]) -> List[List[float]]:
-    """Call Azure OpenAI Embedding API in batches (max 16 per batch, 1s sleep between). 429 → wait 60s, max 3 retries."""
+    """批量调用 Embedding API。
+
+    对齐 PRD：batch size=20（配合 chunk 大小控制请求体规模）。
+    """
     if not texts:
         return []
     client = _get_azure_openai_client()
@@ -70,20 +79,34 @@ def get_chroma_collection():
     return client.get_or_create_collection(name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
 
 
-def add_chunks_to_chroma(source_filename: str, chunks: List[str]) -> int:
-    """Embed chunks in batch, add to Chroma with metadata source_filename. Returns count added."""
+def add_chunks_to_chroma(source_filename: str, chunks: List[str], page_numbers: List[int]) -> int:
+    """将 chunk + 元数据写入 Chroma。
+
+    元数据至少包含：
+    - source_filename（用于 citation 文件名）
+    - page（用于 citation 页码）
+    """
     if not chunks:
         return 0
+    if len(chunks) != len(page_numbers):
+        raise ValueError("len(chunks) must equal len(page_numbers)")
+
     embeddings = embed_texts_batch(chunks)
     coll = get_chroma_collection()
-    ids = [f"{source_filename}_{i}" for i in range(len(chunks))]
-    metadatas = [{"source_filename": source_filename} for _ in chunks]
+    ids = [f"{source_filename}_{page}_{i}_{uuid4().hex[:8]}" for i, page in enumerate(page_numbers)]
+    metadatas = [
+        {
+            "source_filename": source_filename,
+            "page": int(page_numbers[i]),
+        }
+        for i in range(len(chunks))
+    ]
     coll.add(ids=ids, embeddings=embeddings, documents=chunks, metadatas=metadatas)
     return len(chunks)
 
 
 def retrieve_from_chroma(query: str, top_k: int = 5) -> List[dict]:
-    """Embed query, run cosine similarity search in Chroma. Returns list of {chunk, title, doc_id}."""
+    """查询 Chroma 向量库，返回检索到的 chunk 与 citation 元数据。"""
     if top_k <= 0:
         return []
     client = _get_azure_openai_client()
@@ -95,5 +118,6 @@ def retrieve_from_chroma(query: str, top_k: int = 5) -> List[dict]:
     out = []
     for i, (doc, meta) in enumerate(zip(results["documents"][0] or [], results["metadatas"][0] or [])):
         title = (meta or {}).get("source_filename", "")
-        out.append({"chunk": doc or "", "title": title, "doc_id": i + 1})
+        page = int((meta or {}).get("page", 0) or 0)
+        out.append({"chunk": doc or "", "title": title, "page": page, "doc_id": i + 1})
     return out
