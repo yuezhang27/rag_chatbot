@@ -16,9 +16,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple
 
-from scripts.chroma_embed import add_chunks_to_chroma
-from scripts.prepdocs.pdfparser import parse_pdf_pages
-from scripts.prepdocs.textsplitter import split_text
+# 兼容两种运行方式：
+# 1) python -m scripts.prepdocs
+# 2) python scripts/prepdocs.py
+try:
+    from scripts.chroma_embed import add_chunks_to_chroma
+    from scripts.prepdocs.pdfparser import parse_pdf_pages
+    from scripts.prepdocs.textsplitter import split_text
+except ModuleNotFoundError:
+    from chroma_embed import add_chunks_to_chroma
+    from prepdocs.pdfparser import parse_pdf_pages
+    from prepdocs.textsplitter import split_text
 
 DATABASE_PATH = "chatbot.db"
 
@@ -43,6 +51,13 @@ def init_docs_table() -> None:
         )
         """
     )
+
+    # 兼容旧数据库：历史表可能没有 page_number 列，这里自动迁移。
+    cursor.execute("PRAGMA table_info(docs)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if "page_number" not in columns:
+        cursor.execute("ALTER TABLE docs ADD COLUMN page_number INTEGER")
+
     conn.commit()
     conn.close()
 
@@ -93,6 +108,11 @@ def ingest_one_pdf(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Ingest PDFs into SQLite + ChromaDB")
     parser.add_argument("--input-dir", default="data", help="PDF directory path")
+    parser.add_argument(
+        "--pattern",
+        default="*.pdf",
+        help="PDF glob pattern under input-dir, e.g. 'test*.pdf'",
+    )
     parser.add_argument("--parser", choices=["local", "azure"], default="local", help="PDF parser backend")
     parser.add_argument("--chunk-size", type=int, default=400, help="Chunk size")
     parser.add_argument("--chunk-overlap", type=int, default=80, help="Chunk overlap")
@@ -107,9 +127,10 @@ def main() -> None:
     if not input_dir.exists() or not input_dir.is_dir():
         raise ValueError(f"input-dir not found: {input_dir}")
 
-    pdf_files = sorted([p for p in input_dir.iterdir() if p.suffix.lower() == ".pdf"])
+    # 这里支持按文件模式筛选（例如 test*.pdf），便于 E2E 只 ingest 测试文件。
+    pdf_files = sorted([p for p in input_dir.glob(args.pattern) if p.is_file() and p.suffix.lower() == ".pdf"])
     if not pdf_files:
-        print(f"[prepdocs] no pdf files found under: {input_dir}")
+        print(f"[prepdocs] no pdf files found under: {input_dir} with pattern={args.pattern}")
         return
 
     total_sqlite = 0

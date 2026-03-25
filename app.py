@@ -47,6 +47,12 @@ def init_db() -> None:
         """
     )
 
+    # 兼容旧库：若 docs 是历史表结构（无 page_number），在启动时自动补列。
+    cursor.execute("PRAGMA table_info(docs)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if "page_number" not in columns:
+        cursor.execute("ALTER TABLE docs ADD COLUMN page_number INTEGER")
+
     conn.commit()
     conn.close()
 
@@ -339,4 +345,3 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
-
