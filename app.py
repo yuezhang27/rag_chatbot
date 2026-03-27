@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse
 from openai import AzureOpenAI
 from pydantic import BaseModel
 
-from scripts.chroma_embed import retrieve_from_chroma
+from scripts.search_client import get_search_client
 
 load_dotenv()
 
@@ -88,9 +88,10 @@ class ChatRequest(BaseModel):
 
 
 class Citation(BaseModel):
-    # Day4 前对齐：citation 仅展示文件名 + 页码
+    # Day5 增强：文件名 + 页码 + 片段文本（~20 tokens）
     filename: str
     page: int
+    snippet: str = ""
 
 
 class ChatResponse(BaseModel):
@@ -205,6 +206,7 @@ def _build_citations_from_retrieved(retrieved: List[dict]) -> List[Citation]:
             Citation(
                 filename=doc.get("title", "unknown"),
                 page=int(doc.get("page", 0) or 0),
+                snippet=doc.get("snippet", ""),
             )
         )
     return citations
@@ -251,10 +253,10 @@ def chat_answer(request: ChatRequest):
     """
     conversation_id = create_conversation_if_needed(request.conversation_id)
 
-    # Retrieval 阶段：Day2 的向量检索
+    # Retrieval 阶段：通过 SearchClient 适配层（本地 Chroma / 生产 Azure AI Search）
     retrieved: List[dict] = []
     if request.use_retrieval:
-        retrieved = retrieve_from_chroma(request.message, top_k=request.top_k)
+        retrieved = get_search_client().search(request.message, top_k=request.top_k)
 
     # Generation 阶段：将前端传入的完整 history 原样转发给模型
     # （ADR 决策：history 由前端维护，后端不读历史数据库）
@@ -294,7 +296,7 @@ def chat_stream(request: ChatRequest):
 
     retrieved: List[dict] = []
     if request.use_retrieval:
-        retrieved = retrieve_from_chroma(request.message, top_k=request.top_k)
+        retrieved = get_search_client().search(request.message, top_k=request.top_k)
 
     history: List[HistoryMessage] = request.history or []
     messages: List[dict] = [{"role": "system", "content": "你是企业 HR 知识库助手。"}]

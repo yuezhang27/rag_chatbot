@@ -20,11 +20,13 @@ from typing import List, Tuple
 # 1) python -m scripts.prepdocs
 # 2) python scripts/prepdocs.py
 try:
-    from scripts.chroma_embed import add_chunks_to_chroma
+    from scripts.search_client import get_search_client
     from scripts.prepdocs.pdfparser import parse_pdf_pages
     from scripts.prepdocs.textsplitter import split_text
 except ModuleNotFoundError:
-    from chroma_embed import add_chunks_to_chroma
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from scripts.search_client import get_search_client
     from prepdocs.pdfparser import parse_pdf_pages
     from prepdocs.textsplitter import split_text
 
@@ -101,8 +103,11 @@ def ingest_one_pdf(
         all_chunks.extend(chunks)
         all_pages.extend([page_number] * len(chunks))
 
-    chroma_count = add_chunks_to_chroma(source_filename=pdf_path.name, chunks=all_chunks, page_numbers=all_pages)
-    return sqlite_count, chroma_count
+    search_client = get_search_client()
+    index_count = search_client.add_documents(
+        source_filename=pdf_path.name, chunks=all_chunks, page_numbers=all_pages
+    )
+    return sqlite_count, index_count
 
 
 def parse_args() -> argparse.Namespace:
@@ -120,6 +125,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    from dotenv import load_dotenv
+    load_dotenv()
     args = parse_args()
     init_docs_table()
 
@@ -133,26 +140,30 @@ def main() -> None:
         print(f"[prepdocs] no pdf files found under: {input_dir} with pattern={args.pattern}")
         return
 
+    import os
+    backend = os.environ.get("SEARCH_BACKEND", "local")
+    print(f"[prepdocs] 检索后端: SEARCH_BACKEND={backend!r}")
+
     total_sqlite = 0
-    total_chroma = 0
+    total_index = 0
 
     for pdf in pdf_files:
-        sqlite_count, chroma_count = ingest_one_pdf(
+        sqlite_count, index_count = ingest_one_pdf(
             pdf_path=pdf,
             parser_backend=args.parser,
             chunk_size=args.chunk_size,
             chunk_overlap=args.chunk_overlap,
         )
         total_sqlite += sqlite_count
-        total_chroma += chroma_count
+        total_index += index_count
         print(
-            f"[prepdocs] {pdf.name}: sqlite_chunks={sqlite_count}, chroma_chunks={chroma_count}",
+            f"[prepdocs] {pdf.name}: sqlite_chunks={sqlite_count}, index_chunks={index_count}",
         )
 
     print("-" * 60)
     print(
         "[prepdocs] done: "
-        f"files={len(pdf_files)}, total_sqlite_chunks={total_sqlite}, total_chroma_chunks={total_chroma}",
+        f"files={len(pdf_files)}, total_sqlite_chunks={total_sqlite}, total_index_chunks={total_index}",
     )
 
 

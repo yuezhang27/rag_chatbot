@@ -5,6 +5,7 @@ type Role = "user" | "assistant";
 interface Citation {
   filename: string;
   page: number;
+  snippet?: string;
 }
 
 interface Message {
@@ -169,6 +170,7 @@ const ChatPage: React.FC = () => {
                         {m.citations.map((c, index) => (
                           <li key={`${c.filename}-${c.page}-${index}`}>
                             <strong>{c.filename}</strong> · 第 {c.page} 页
+                            {c.snippet && <span className="citation-snippet"> — {c.snippet}</span>}
                           </li>
                         ))}
                       </ul>
@@ -287,6 +289,7 @@ const AskPage: React.FC = () => {
                         {m.citations.map((c, index) => (
                           <li key={`${c.filename}-${c.page}-${index}`}>
                             <strong>{c.filename}</strong> · 第 {c.page} 页
+                            {c.snippet && <span className="citation-snippet"> — {c.snippet}</span>}
                           </li>
                         ))}
                       </ul>

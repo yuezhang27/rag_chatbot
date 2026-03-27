@@ -71,6 +71,11 @@ body {
   cursor: pointer;
 }
 
+.citation-snippet {
+  color: #6b7280;
+  font-style: italic;
+}
+
 .placeholder {
   text-align: center;
   color: #9ca3af;
