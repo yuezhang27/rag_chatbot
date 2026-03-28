@@ -266,27 +266,7 @@ PDF 文件 → 分块 → 生成 embedding → 写入检索后端（Chroma 或 A
 
 完整数据流（你的项目）
 
-【一次性准备】
-
-data/\*.pdf
-↓ prepdocs.py
-├─ PyMuPDF 按页提取文本
-├─ 分块（400字符，80重叠）
-├─ 调用 Azure OpenAI Embedding API → 每个chunk变成1536维向量
-└─ 写入检索后端
-├─ SEARCH_BACKEND=local → 写 chroma_db/ 文件夹
-└─ SEARCH_BACKEND=azure → 写 Azure AI Search 索引
-
-【每次用户问问题】
-
-用户输入
-↓ app.py
-├─ 调用 Embedding API → 问题变成向量
-├─ 去检索后端搜索
-│ ├─ local: ChromaDB 向量相似度，返回 top-5
-│ └─ azure: BM25关键词 + 向量 → 召回top-20 → Semantic Ranker精排 → top-5
-├─ 把 top-5 的文本拼进 prompt
-└─ 调用 Azure OpenAI Chat API → LLM 生成回答 → SSE 流式返回
+![alt text](image-1.png)
 
 ---
 
