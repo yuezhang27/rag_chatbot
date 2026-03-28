@@ -279,3 +279,12 @@ app.py 只调用 get_search_client().search()，不关心后端是谁。
 工厂函数读 SEARCH_BACKEND 决定给你一个 ChromaSearchClient 还是 AzureSearchClient，两者对外接口完全一样。
 
 ![alt text](image-2.png)
+
+## 前期准备
+
+--parser local 指的是怎么解析 PDF，跟存到哪里完全无关。
+
+--parser local → 用 PyMuPDF（本地库）读 PDF 文字
+--parser azure → 用 Azure Document Intelligence（OCR 云服务）读 PDF 文字
+
+HR PDF 是数字版（不是扫描件），PyMuPDF 能直接读，所以一直用 local。SEARCH_BACKEND 控制存哪里，--parser 控制怎么读原始文件，两个维度正交。
