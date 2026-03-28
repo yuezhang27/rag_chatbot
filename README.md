@@ -1,5 +1,35 @@
 ## 超小 RAG Chatbot MVP
 
+### E2E
+
+#### 准备资料
+
+```text
+<!-- 容器启动 -->
+docker compose up -d
+
+<!-- 用local parser解析，然后扫文件，存数据 -->
+docker exec rag-backend python scripts/prepdocs.py --input-dir data --pattern "test*.pdf" --parser local
+
+<!-- 自动根据.env里 SEARCH_BACKEND 决定检查哪个后端。 -->
+docker exec rag-backend python scripts/check_index.py
+```
+
+（原本的数据库检查：如果.env里，储存在chromaDB，用本地模式
+docker exec rag-backend python scripts/check_chroma.py
+）
+
+#### E2E
+
+- http://localhost:3000/
+- http://localhost:3000/ask
+
+#### 关闭
+
+```text
+docker compose down
+```
+
 ### 如何使用OpenCode进行vibe coding
 
 - Step1. cmd，执行命令`wsl`
@@ -109,8 +139,8 @@ curl -X POST "http://localhost:8000/admin/documents/upload?parser=azure" ^
 
 返回示例：`{"filename":"xxx.pdf","title":"xxx","chunks_inserted":12}`
 
-3. **验证上传结果**  
-   - 再调用 `POST /v1/chat/answer`，`question` 里提一个 PDF 中的问题，`use_retrieval: true`，看是否能检索到并回答。  
+3. **验证上传结果**
+   - 再调用 `POST /v1/chat/answer`，`question` 里提一个 PDF 中的问题，`use_retrieval: true`，看是否能检索到并回答。
    - 或直接查 SQLite：`SELECT id, title, length(chunk) FROM docs;`
 
 # rag_chatbot
