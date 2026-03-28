@@ -115,7 +115,7 @@ def _make_index(name: str, semantic_config: str) -> SearchIndex:
 def _ensure_index_exists(endpoint: str, credential: AzureKeyCredential, index_name: str, semantic_config: str) -> None:
     """若索引不存在则创建；已存在则跳过（幂等）。"""
     idx_client = SearchIndexClient(endpoint=endpoint, credential=credential)
-    existing = [idx.name for idx in idx_client.list_index_names()]
+    existing = list(idx_client.list_index_names())
     if index_name not in existing:
         logger.info("[AzureSearch] 索引 %r 不存在，正在创建…", index_name)
         idx_client.create_index(_make_index(index_name, semantic_config))
@@ -233,11 +233,13 @@ class AzureSearchClient(SearchClient):
             raise RuntimeError(f"Azure AI Search 写索引失败（embedding 阶段）: {exc}") from exc
 
         # 构建文档列表
+        # Azure AI Search key 只允许字母/数字/下划线/连字符/等号，需清洗文件名
+        safe_name = "".join(c if c.isalnum() or c in "-_=" else "_" for c in source_filename)
         docs = []
         for i, (chunk, page, emb) in enumerate(zip(chunks, page_numbers, embeddings)):
             docs.append(
                 {
-                    "id": f"{source_filename}_{page}_{i}_{uuid4().hex[:8]}",
+                    "id": f"{safe_name}_{page}_{i}_{uuid4().hex[:8]}",
                     "content": chunk,
                     "content_vector": emb,
                     "source_filename": source_filename,
