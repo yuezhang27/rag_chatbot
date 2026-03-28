@@ -274,10 +274,8 @@ PDF 文件 → 分块 → 生成 embedding → 写入检索后端（Chroma 或 A
 
 这就是今天实现的 Adapter 模式的作用。
 
-app.py 只调用 get_search_client().search()，不关心后端是谁。工厂函数读 SEARCH_BACKEND 决定给你一个 ChromaSearchClient 还是
-AzureSearchClient，两者对外接口完全一样。
+app.py 只调用 get_search_client().search()，不关心后端是谁。
 
-SEARCH_BACKEND=local → ChromaSearchClient → chroma_db/
-SEARCH_BACKEND=azure → AzureSearchClient → Azure 云端
-↑
-上层代码完全不感知差异
+工厂函数读 SEARCH_BACKEND 决定给你一个 ChromaSearchClient 还是 AzureSearchClient，两者对外接口完全一样。
+
+![alt text](image-2.png)
