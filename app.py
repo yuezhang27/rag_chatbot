@@ -172,13 +172,22 @@ def create_conversation_if_needed(conversation_id: Optional[str]) -> str:
 #     ...
 
 
+SYSTEM_PROMPT = """你是企业 HR 知识库助手。
+
+【回答规则】
+1. 只基于下方用户消息中提供的 <context> 内容回答，禁止使用任何外部知识推断或编造。
+2. 如果 <context> 中没有足够信息支持答案，必须明确说"根据现有资料无法确认"，不得猜测。
+3. 回答时如引用具体内容，请在句末标注来源，格式为：（来源：文件名，第 X 页）。
+4. 回答语言跟随用户提问语言（中文问则中文答，英文问则英文答）。"""
+
+
 def build_prompt(message: str, docs: List[Union[sqlite3.Row, dict]]) -> str:
-    """RAG Pipeline 的 Prompt 拼装阶段（Pipeline Pattern 的 Generation 前置步骤）。"""
+    """RAG Pipeline 的 Prompt 拼装阶段，含 CoT 引导。"""
     if not docs:
         return (
-            "你是企业 HR 知识库助手。请优先基于给定上下文回答；"
-            "若上下文不足，请明确说明不知道，不要编造。\n\n"
-            f"Question: {message}"
+            "请回答以下问题。注意：当前没有检索到任何相关文档片段，"
+            '请直接说明"根据现有资料无法确认"，不要基于通用知识作答。\n\n'
+            f"问题：{message}"
         )
 
     context_parts = []
@@ -186,15 +195,19 @@ def build_prompt(message: str, docs: List[Union[sqlite3.Row, dict]]) -> str:
         chunk = doc.get("chunk", "") if isinstance(doc, dict) else doc["chunk"]
         filename = doc.get("title", "unknown") if isinstance(doc, dict) else doc["title"]
         page = doc.get("page", 0) if isinstance(doc, dict) else doc["page_number"]
-        context_parts.append(f"[Document {i}] {filename} (page {page})\n{chunk}")
+        context_parts.append(f"[文档 {i}]《{filename}》第 {page} 页\n{chunk}")
     context_text = "\n\n".join(context_parts)
 
     prompt = (
-        "你是企业 HR 知识库助手。请严格依据 context 回答。\n"
-        "若 context 无法支持答案，请明确说“根据现有资料无法确认”。\n\n"
-        f"{context_text}\n\n"
-        f"Question: {message}\n\n"
-        "请给出清晰答案。"
+        "<context>\n"
+        f"{context_text}\n"
+        "</context>\n\n"
+        "请按以下步骤处理：\n"
+        "第一步（内部思考，不输出）：逐一检查上方 <context> 中哪些段落与问题直接相关，"
+        '哪些段落无关。若所有段落均无关，直接执行第二步的"无法确认"策略。\n'
+        "第二步：基于且仅基于第一步找到的相关段落，给出清晰、完整的回答；"
+        "引用具体内容时标注来源文件名和页码。\n\n"
+        f"问题：{message}"
     )
     return prompt
 
@@ -217,7 +230,7 @@ def _sse_event(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
 
 # 下面保留旧的上传 API（注释），不直接删除：
-# 它对应 Day1 时“管理员通过后端接口上传文档”的实现。
+# 它对应 Day1 时"管理员通过后端接口上传文档"的实现。
 # 当前按 PRD/ADR 收敛：文档 ingestion 改为手动脚本 scripts/prepdocs.py，
 # 因为 HR 文档更新频率低，上传 UI/API ROI 不高。
 # @app.post("/admin/documents/upload")
@@ -261,7 +274,7 @@ def chat_answer(request: ChatRequest):
     # Generation 阶段：将前端传入的完整 history 原样转发给模型
     # （ADR 决策：history 由前端维护，后端不读历史数据库）
     history: List[HistoryMessage] = request.history or []
-    messages: List[dict] = [{"role": "system", "content": "你是企业 HR 知识库助手。"}]
+    messages: List[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
     for m in history:
         messages.append({"role": m.role, "content": m.content})
     prompt = build_prompt(request.message, retrieved)
@@ -299,7 +312,7 @@ def chat_stream(request: ChatRequest):
         retrieved = get_search_client().search(request.message, top_k=request.top_k)
 
     history: List[HistoryMessage] = request.history or []
-    messages: List[dict] = [{"role": "system", "content": "你是企业 HR 知识库助手。"}]
+    messages: List[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
     for m in history:
         messages.append({"role": m.role, "content": m.content})
     prompt = build_prompt(request.message, retrieved)
@@ -336,7 +349,7 @@ def chat_stream(request: ChatRequest):
 
 
 # 保留旧 Ask 独立接口（注释，不删除）：
-# 原实现对应“Chat/Ask 双接口”。
+# 原实现对应"Chat/Ask 双接口"。
 # 当前按 ADR 收敛：Ask = history 为空的 Chat，请统一走 /v1/chat/stream。
 # @app.post("/v1/ask/stream")
 # def ask_stream(request: AskRequest):
