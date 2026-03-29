@@ -76,6 +76,29 @@ body {
   font-style: italic;
 }
 
+.feedback-btn {
+  margin-top: 6px;
+  background: none;
+  border: 1px solid #e5e7eb;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+  padding: 2px 6px;
+  opacity: 0.5;
+  display: block;
+}
+
+.feedback-btn:hover:not(:disabled) {
+  opacity: 1;
+  border-color: #9ca3af;
+}
+
+.feedback-btn.thumbed-down {
+  opacity: 1;
+  border-color: #ef4444;
+  cursor: default;
+}
+
 .placeholder {
   text-align: center;
   color: #9ca3af;

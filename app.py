@@ -19,6 +19,52 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Azure Blob Storage — optional, gracefully skipped if env var not set
+# ---------------------------------------------------------------------------
+
+def _save_conversation_to_blob(
+    conversation_id: str,
+    history: List,
+    answer: str,
+    citations: List,
+) -> None:
+    """将完整对话覆盖写入 Blob Storage。失败只 log，不向上传播。"""
+    conn_str = os.environ.get("AZURE_BLOB_CONNECTION_STRING", "")
+    if not conn_str:
+        return
+    container_name = os.environ.get("AZURE_BLOB_CONTAINER_NAME", "conversation-logs")
+    try:
+        from azure.storage.blob import BlobServiceClient
+        svc = BlobServiceClient.from_connection_string(conn_str)
+        container = svc.get_container_client(container_name)
+        try:
+            container.create_container()
+        except Exception:
+            pass  # 容器已存在则忽略
+
+        history_dicts = [{"role": m.role, "content": m.content} if hasattr(m, "role") else m
+                         for m in history]
+        payload = {
+            "conversation_id": conversation_id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "messages": history_dicts + [
+                {
+                    "role": "assistant",
+                    "content": answer,
+                    "citations": [c.dict() if hasattr(c, "dict") else c for c in citations],
+                }
+            ],
+        }
+        container.get_blob_client(f"{conversation_id}.json").upload_blob(
+            json.dumps(payload, ensure_ascii=False),
+            overwrite=True,
+        )
+        logger.debug("Blob written: conversation_id=%s", conversation_id)
+    except Exception as exc:
+        logger.error("Blob write failed: conversation_id=%s error=%s", conversation_id, exc)
+
 # ---------------------------------------------------------------------------
 # Langfuse — optional, gracefully skipped if env vars not set
 # ---------------------------------------------------------------------------
@@ -125,6 +171,12 @@ class ChatResponse(BaseModel):
     conversation_id: str
     answer: str
     citations: List[Citation]
+
+
+class FeedbackRequest(BaseModel):
+    conversation_id: str
+    message_index: int
+    reason: Optional[str] = None
 
 
 app = FastAPI()
@@ -396,6 +448,12 @@ def chat_answer(request: ChatRequest):
                 pass
 
     citations = _build_citations_from_retrieved(retrieved)
+    _save_conversation_to_blob(
+        conversation_id=conversation_id,
+        history=request.history or [],
+        answer=answer,
+        citations=citations,
+    )
     return ChatResponse(
         conversation_id=conversation_id,
         answer=answer,
@@ -528,6 +586,14 @@ def chat_stream(request: ChatRequest):
 
         yield _sse_event("done", {"conversation_id": conversation_id})
 
+        # Blob 写入在 done event 之后，确保 full_text 已完整收集
+        _save_conversation_to_blob(
+            conversation_id=conversation_id,
+            history=request.history or [],
+            answer=full_text,
+            citations=_build_citations_from_retrieved(retrieved),
+        )
+
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
@@ -537,6 +603,22 @@ def chat_stream(request: ChatRequest):
 # @app.post("/v1/ask/stream")
 # def ask_stream(request: AskRequest):
 #     ...
+
+
+@app.post("/v1/feedback")
+def feedback(request: FeedbackRequest):
+    """Thumbs Down 用户反馈。
+
+    记录到结构化日志；若 Application Insights 已接入，日志自动采集为 Trace。
+    反馈丢失可接受（不影响主链路），所以始终返回 ok=true。
+    """
+    logger.info(
+        "thumbs_down conversation_id=%s message_index=%d reason=%s",
+        request.conversation_id,
+        request.message_index,
+        request.reason or "",
+    )
+    return {"ok": True}
 
 
 if __name__ == "__main__":

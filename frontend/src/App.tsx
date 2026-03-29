@@ -13,6 +13,7 @@ interface Message {
   role: Role;
   content: string;
   citations?: Citation[];
+  thumbedDown?: boolean;
 
   // 保留旧字段注释，不直接删除：
   // 原本对应调试需求（展示 thought_process: prompt + retrieved chunks）。
@@ -20,7 +21,7 @@ interface Message {
   // thoughtProcess?: ThoughtProcess;
 }
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = (import.meta as any).env?.VITE_API_BASE || "http://localhost:8000";
 
 async function streamSSE(
   url: string,
@@ -78,6 +79,19 @@ async function streamSSE(
       // if (event === "thought_process") { ... }
       // else if (event === "token") { ... }
     }
+  }
+}
+
+async function sendFeedback(conversationId: string | null, messageIndex: number) {
+  if (!conversationId) return;
+  try {
+    await fetch(`${API_BASE}/v1/feedback`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ conversation_id: conversationId, message_index: messageIndex }),
+    });
+  } catch (_) {
+    // feedback loss is acceptable
   }
 }
 
@@ -158,37 +172,46 @@ const ChatPage: React.FC = () => {
       <header className="app-header">RAG Chatbot (Chat)</header>
       <main className="chat-container">
         <div className="messages">
-          {messages.map((m) => (
+          {messages.map((m, msgIndex) => (
             <div key={m.id} className={`message-row ${m.role}`}>
-              <div className="bubble">
-                <div className="content">{m.content}</div>
-                {m.role === "assistant" && m.citations && m.citations.length > 0 && (
-                  <div className="citations">
+              <div className=”bubble”>
+                <div className=”content”>{m.content}</div>
+                {m.role === “assistant” && m.citations && m.citations.length > 0 && (
+                  <div className=”citations”>
                     <details>
                       <summary>Citations ({m.citations.length})</summary>
                       <ul>
                         {m.citations.map((c, index) => (
                           <li key={`${c.filename}-${c.page}-${index}`}>
                             <strong>{c.filename}</strong> · 第 {c.page} 页
-                            {c.snippet && <span className="citation-snippet"> — {c.snippet}</span>}
+                            {c.snippet && <span className=”citation-snippet”> — {c.snippet}</span>}
                           </li>
                         ))}
                       </ul>
                     </details>
                   </div>
                 )}
-
-                {/*
-                  保留旧 UI（注释不删除）：
-                  原本用于展示 thought_process 调试信息。
-                  现在按 PRD“移除 Thought Process 面板”的范围收敛。
-                */}
+                {m.role === “assistant” && m.content && (
+                  <button
+                    className={`feedback-btn${m.thumbedDown ? “ thumbed-down” : “”}`}
+                    disabled={m.thumbedDown}
+                    onClick={() => {
+                      setMessages((prev) =>
+                        prev.map((msg) => msg.id === m.id ? { ...msg, thumbedDown: true } : msg)
+                      );
+                      sendFeedback(conversationId, msgIndex);
+                    }}
+                    title=”回答有误或无帮助”
+                  >
+                    👎
+                  </button>
+                )}
               </div>
             </div>
           ))}
 
           {messages.length === 0 && (
-            <div className="placeholder">多轮对话模式：上下文在前端维护，刷新后清空。</div>
+            <div className=”placeholder”>多轮对话模式：上下文在前端维护，刷新后清空。</div>
           )}
         </div>
 
@@ -277,7 +300,7 @@ const AskPage: React.FC = () => {
       <header className="app-header">RAG Chatbot (Ask)</header>
       <main className="chat-container">
         <div className="messages">
-          {messages.map((m) => (
+          {messages.map((m, msgIndex) => (
             <div key={m.id} className={`message-row ${m.role}`}>
               <div className="bubble">
                 <div className="content">{m.content}</div>
@@ -295,6 +318,21 @@ const AskPage: React.FC = () => {
                       </ul>
                     </details>
                   </div>
+                )}
+                {m.role === "assistant" && m.content && (
+                  <button
+                    className={`feedback-btn${m.thumbedDown ? " thumbed-down" : ""}`}
+                    disabled={m.thumbedDown}
+                    onClick={() => {
+                      setMessages((prev) =>
+                        prev.map((msg) => msg.id === m.id ? { ...msg, thumbedDown: true } : msg)
+                      );
+                      sendFeedback(null, msgIndex);
+                    }}
+                    title="回答有误或无帮助"
+                  >
+                    👎
+                  </button>
                 )}
               </div>
             </div>
