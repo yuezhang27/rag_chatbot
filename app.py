@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import sqlite3
 from datetime import datetime
@@ -15,6 +16,32 @@ from pydantic import BaseModel
 from scripts.search_client import get_search_client
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Langfuse — optional, gracefully skipped if env vars not set
+# ---------------------------------------------------------------------------
+_langfuse = None
+
+def _init_langfuse():
+    global _langfuse
+    pk = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
+    sk = os.environ.get("LANGFUSE_SECRET_KEY", "")
+    host = os.environ.get("LANGFUSE_HOST", "https://cloud.langfuse.com")
+    if not pk or not sk:
+        logger.info("Langfuse env vars not set — tracing disabled")
+        return
+    try:
+        from langfuse import Langfuse
+        _langfuse = Langfuse(public_key=pk, secret_key=sk, host=host)
+        logger.info("Langfuse initialised (host=%s)", host)
+    except Exception as exc:
+        logger.warning("Langfuse init failed, tracing disabled: %s", exc)
+
+def _lf():
+    """Return the Langfuse client, or None if not configured."""
+    return _langfuse
 
 
 DATABASE_PATH = "chatbot.db"
@@ -106,6 +133,16 @@ app = FastAPI()
 @app.on_event("startup")
 def startup_event() -> None:
     init_db()
+    _init_langfuse()
+    # Azure Application Insights — optional, auto-instruments FastAPI HTTP layer
+    ai_conn = os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING", "")
+    if ai_conn:
+        try:
+            from azure.monitor.opentelemetry import configure_azure_monitor
+            configure_azure_monitor(connection_string=ai_conn)
+            logger.info("Azure Application Insights initialised")
+        except Exception as exc:
+            logger.warning("Application Insights init failed: %s", exc)
 
 
 @app.get("/")
@@ -265,30 +302,100 @@ def chat_answer(request: ChatRequest):
     Day4 主路线是 `/v1/chat/stream`，但保留该接口用于本地验证 RAG 基本闭环。
     """
     conversation_id = create_conversation_if_needed(request.conversation_id)
+    lf = _lf()
+    trace = None
+    try:
+        if lf:
+            trace = lf.trace(
+                name="rag-chat-answer",
+                input={"message": request.message},
+                metadata={"conversation_id": conversation_id},
+            )
+    except Exception:
+        pass
 
-    # Retrieval 阶段：通过 SearchClient 适配层（本地 Chroma / 生产 Azure AI Search）
+    # ── Retrieval ────────────────────────────────────────────────────────────
     retrieved: List[dict] = []
     if request.use_retrieval:
-        retrieved = get_search_client().search(request.message, top_k=request.top_k)
+        try:
+            if trace:
+                span = trace.span(name="retrieve", input={"query": request.message})
+            retrieved = get_search_client().search(request.message, top_k=request.top_k)
+            if trace:
+                span.end(output={
+                    "chunks_count": len(retrieved),
+                    "sources": [{"title": d.get("title"), "page": d.get("page")} for d in retrieved],
+                })
+        except Exception as exc:
+            if trace:
+                try:
+                    span.end(output={"error": str(exc)})
+                except Exception:
+                    pass
+            raise
 
-    # Generation 阶段：将前端传入的完整 history 原样转发给模型
-    # （ADR 决策：history 由前端维护，后端不读历史数据库）
+    # ── Prompt ───────────────────────────────────────────────────────────────
     history: List[HistoryMessage] = request.history or []
     messages: List[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
     for m in history:
         messages.append({"role": m.role, "content": m.content})
-    prompt = build_prompt(request.message, retrieved)
-    messages.append({"role": "user", "content": prompt})
 
+    try:
+        if trace:
+            bp_span = trace.span(name="build_prompt", input={"docs_count": len(retrieved)})
+        prompt = build_prompt(request.message, retrieved)
+        messages.append({"role": "user", "content": prompt})
+        if trace:
+            bp_span.end(output={"prompt_length": len(prompt)})
+    except Exception:
+        if trace:
+            try:
+                bp_span.end()
+            except Exception:
+                pass
+        raise
+
+    # ── LLM Generation ───────────────────────────────────────────────────────
+    deployment = get_chat_deployment()
     client = get_client()
-    completion = client.chat.completions.create(
-        model=get_chat_deployment(),
-        messages=messages,
-    )
-    answer = completion.choices[0].message.content or ""
+    gen_span = None
+    try:
+        if trace:
+            gen_span = trace.generation(
+                name="llm_generate",
+                model=deployment,
+                input=messages,
+            )
+        completion = client.chat.completions.create(
+            model=deployment,
+            messages=messages,
+        )
+        answer = completion.choices[0].message.content or ""
+        if gen_span:
+            usage = getattr(completion, "usage", None)
+            gen_span.end(
+                output=answer,
+                usage={
+                    "input": getattr(usage, "prompt_tokens", 0),
+                    "output": getattr(usage, "completion_tokens", 0),
+                    "unit": "TOKENS",
+                } if usage else None,
+            )
+    except Exception as exc:
+        if gen_span:
+            try:
+                gen_span.end(output={"error": str(exc)})
+            except Exception:
+                pass
+        raise
+    finally:
+        if lf:
+            try:
+                lf.flush()
+            except Exception:
+                pass
 
     citations = _build_citations_from_retrieved(retrieved)
-
     return ChatResponse(
         conversation_id=conversation_id,
         answer=answer,
@@ -306,44 +413,120 @@ def chat_stream(request: ChatRequest):
     3) `done` 结束
     """
     conversation_id = create_conversation_if_needed(request.conversation_id)
+    lf = _lf()
+    trace = None
+    try:
+        if lf:
+            trace = lf.trace(
+                name="rag-chat-stream",
+                input={"message": request.message},
+                metadata={"conversation_id": conversation_id},
+            )
+    except Exception:
+        pass
 
+    # ── Retrieval ────────────────────────────────────────────────────────────
     retrieved: List[dict] = []
     if request.use_retrieval:
-        retrieved = get_search_client().search(request.message, top_k=request.top_k)
+        try:
+            if trace:
+                r_span = trace.span(name="retrieve", input={"query": request.message})
+            retrieved = get_search_client().search(request.message, top_k=request.top_k)
+            if trace:
+                r_span.end(output={
+                    "chunks_count": len(retrieved),
+                    "sources": [{"title": d.get("title"), "page": d.get("page")} for d in retrieved],
+                })
+        except Exception as exc:
+            if trace:
+                try:
+                    r_span.end(output={"error": str(exc)})
+                except Exception:
+                    pass
+            raise
 
+    # ── Prompt ───────────────────────────────────────────────────────────────
     history: List[HistoryMessage] = request.history or []
     messages: List[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
     for m in history:
         messages.append({"role": m.role, "content": m.content})
-    prompt = build_prompt(request.message, retrieved)
-    messages.append({"role": "user", "content": prompt})
 
+    try:
+        if trace:
+            bp_span = trace.span(name="build_prompt", input={"docs_count": len(retrieved)})
+        prompt = build_prompt(request.message, retrieved)
+        messages.append({"role": "user", "content": prompt})
+        if trace:
+            bp_span.end(output={"prompt_length": len(prompt)})
+    except Exception:
+        if trace:
+            try:
+                bp_span.end()
+            except Exception:
+                pass
+        raise
+
+    # ── LLM streaming — started here, span closed inside generator ───────────
+    deployment = get_chat_deployment()
     client = get_client()
+    # stream_options include_usage：最后一个 chunk 会携带 token 统计
     stream = client.chat.completions.create(
-        model=get_chat_deployment(),
+        model=deployment,
         messages=messages,
         stream=True,
+        stream_options={"include_usage": True},
     )
+    gen_span = None
+    try:
+        if trace:
+            gen_span = trace.generation(
+                name="llm_generate",
+                model=deployment,
+                input=messages,
+            )
+    except Exception:
+        pass
 
     def event_generator():
         citations = _build_citations_from_retrieved(retrieved)
         yield _sse_event("citation_data", {"citations": [c.dict() for c in citations]})
 
-        for chunk in stream:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            text = getattr(delta, "content", None) or ""
-            if not text:
-                continue
-            yield _sse_event("response_text", {"text": text})
+        full_text = ""
+        usage = None
+        try:
+            for chunk in stream:
+                # usage chunk（choices 为空，只含 token 统计）
+                if not chunk.choices:
+                    if getattr(chunk, "usage", None):
+                        usage = chunk.usage
+                    continue
+                delta = chunk.choices[0].delta
+                text = getattr(delta, "content", None) or ""
+                if not text:
+                    continue
+                full_text += text
+                yield _sse_event("response_text", {"text": text})
+        finally:
+            # span 必须在 generator 内关闭，而非在 chat_stream() 函数体内
+            if gen_span:
+                try:
+                    gen_span.end(
+                        output=full_text,
+                        usage={
+                            "input": getattr(usage, "prompt_tokens", 0),
+                            "output": getattr(usage, "completion_tokens", 0),
+                            "unit": "TOKENS",
+                        } if usage else None,
+                    )
+                except Exception:
+                    pass
+            if lf:
+                try:
+                    lf.flush()
+                except Exception:
+                    pass
 
-        yield _sse_event(
-            "done",
-            {
-                "conversation_id": conversation_id,
-            },
-        )
+        yield _sse_event("done", {"conversation_id": conversation_id})
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
