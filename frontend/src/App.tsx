@@ -174,26 +174,26 @@ const ChatPage: React.FC = () => {
         <div className="messages">
           {messages.map((m, msgIndex) => (
             <div key={m.id} className={`message-row ${m.role}`}>
-              <div className=”bubble”>
-                <div className=”content”>{m.content}</div>
-                {m.role === “assistant” && m.citations && m.citations.length > 0 && (
-                  <div className=”citations”>
+              <div className="bubble">
+                <div className="content">{m.content}</div>
+                {m.role === "assistant" && m.citations && m.citations.length > 0 && (
+                  <div className="citations">
                     <details>
                       <summary>Citations ({m.citations.length})</summary>
                       <ul>
                         {m.citations.map((c, index) => (
                           <li key={`${c.filename}-${c.page}-${index}`}>
                             <strong>{c.filename}</strong> · 第 {c.page} 页
-                            {c.snippet && <span className=”citation-snippet”> — {c.snippet}</span>}
+                            {c.snippet && <span className="citation-snippet"> — {c.snippet}</span>}
                           </li>
                         ))}
                       </ul>
                     </details>
                   </div>
                 )}
-                {m.role === “assistant” && m.content && (
+                {m.role === "assistant" && m.content && (
                   <button
-                    className={`feedback-btn${m.thumbedDown ? “ thumbed-down” : “”}`}
+                    className={`feedback-btn${m.thumbedDown ? " thumbed-down" : ""}`}
                     disabled={m.thumbedDown}
                     onClick={() => {
                       setMessages((prev) =>
@@ -201,7 +201,7 @@ const ChatPage: React.FC = () => {
                       );
                       sendFeedback(conversationId, msgIndex);
                     }}
-                    title=”回答有误或无帮助”
+                    title="回答有误或无帮助"
                   >
                     👎
                   </button>
@@ -211,7 +211,7 @@ const ChatPage: React.FC = () => {
           ))}
 
           {messages.length === 0 && (
-            <div className=”placeholder”>多轮对话模式：上下文在前端维护，刷新后清空。</div>
+            <div className="placeholder">多轮对话模式：上下文在前端维护，刷新后清空。</div>
           )}
         </div>
 
