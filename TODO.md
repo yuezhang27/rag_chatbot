@@ -54,17 +54,13 @@ Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/stream" -Cont
 
 ---
 
-## Day 7 — Langfuse 可观测性
+## Day 7 + 8 — Langfuse 可观测性 & RAGAS 评估
 
-### 需要配置（先做这步）
+### 第一步：配置 Langfuse（注册 + 填 .env）
 
-**1. 注册 Langfuse Cloud（免费）**
-
-- 去 https://cloud.langfuse.com 注册账号
-- 创建一个 Project
-- 进入 Project → Settings → API Keys → 复制 Public Key 和 Secret Key
-
-**2. 在 `.env` 里添加（然后重启容器）**
+1. 浏览器打开 https://cloud.langfuse.com，注册账号，创建一个 Project
+2. 进入 Project → Settings → API Keys → 复制 **Public Key**（`pk-lf-...`）和 **Secret Key**（`sk-lf-...`）
+3. 用编辑器打开项目根目录下的 `.env` 文件，添加以下三行（替换成你的真实 key）：
 
 ```
 LANGFUSE_PUBLIC_KEY=pk-lf-xxxxxxxx
@@ -72,113 +68,119 @@ LANGFUSE_SECRET_KEY=sk-lf-xxxxxxxx
 LANGFUSE_HOST=https://cloud.langfuse.com
 ```
 
-**3. 重启 backend 让新 env 生效**
+4. 保存 `.env`，然后在 PowerShell 里重启容器让新配置生效：
 
-```bash
+```powershell
 docker compose up -d
 ```
 
-### E2E 测试
+5. 确认容器已重启、无报错（看最后几行日志）：
 
-**测试 1：非流式 Trace 验证（最快）**
-
-```bash
-curl -s -X POST http://localhost:8000/v1/chat/answer \
-  -H "Content-Type: application/json" \
-  -d '{"message":"What dental benefits are covered?","history":[]}'
+```powershell
+docker compose logs backend --tail 20
 ```
-
-然后去 Langfuse Dashboard → Traces：
-
-- [ ] 出现一条名为 `rag-chat-answer` 的 Trace
-- [ ] 下挂 3 个 Span：`retrieve` / `build_prompt` / `llm_generate`
-- [ ] `retrieve` Span 的 output 包含 sources（文件名 + 页码）
-- [ ] `llm_generate` Span 的 output 是完整回答文本（不为空）
-- [ ] `llm_generate` Span 有 token 用量（input / output tokens）
-
-**测试 2：流式 Trace 验证**
-
-```bash
-curl -s -X POST http://localhost:8000/v1/chat/stream \
-  -H "Content-Type: application/json" \
-  -d '{"message":"What is the vision coverage?","history":[]}' \
-  --no-buffer
-```
-
-去 Langfuse → Traces：
-
-- [ ] 出现 `rag-chat-stream` Trace，`llm_generate` Span 有完整输出（不是空的）
-
-**测试 3：Langfuse 挂掉不影响主链路**
-
-- 注释掉 `.env` 里的 `LANGFUSE_PUBLIC_KEY`，重启容器
-- 再发请求 → 正常返回答案，后端日志无 Exception
-
-### Application Insights（可选，生产再配）
-
-```
-APPLICATIONINSIGHTS_CONNECTION_STRING=InstrumentationKey=xxx;IngestionEndpoint=...
-```
-
-从 Azure Portal → Application Insights 资源 → Overview → 复制 Connection String。
 
 ---
 
-## Day 8 — RAGAS 评估
+### 第二步：填写 RAGAS 评估数据集
 
-### 需要配置（先做这步）
-
-**填写 eval_dataset.json**
-
-文件路径：`data/eval_dataset.json`
-
-当前文件里有 5 道占位题目（`"TODO: fill in..."`），需要你替换成真实的问答对。
-格式要求：
+打开 `data/eval_dataset.json`，把 5 道占位题目替换成基于你的测试 PDF 的真实问答对，格式如下：
 
 ```json
 [
   {
-    "question": "问题（与用户实际会问的一致）",
-    "ground_truth": "标准答案（参考 HR 文档的正确内容）"
+    "question": "What spinal benefits are covered?",
+    "ground_truth": "（从 PDF 里抄对应段落的正确答案）"
+  },
+  {
+    "question": "第二道真实问题",
+    "ground_truth": "对应标准答案"
   }
 ]
 ```
 
-建议至少填 5 题跑通流程，正式评估填 30 题。
+> 至少填满 5 题才能跑出有意义的分数。`ground_truth` 必须是真实文本，不能留空或写 TODO。
 
-### E2E 测试
+---
 
-**测试 1：先跑通（用占位 dataset 也行，但 ground_truth 要是真实文本）**
+### 第三步：E2E 测试（按顺序跑完）
 
-```bash
+**测试 1 — Langfuse 非流式 Trace**
+
+```powershell
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/answer" -ContentType "application/json" -Body '{"message":"What dental benefits are covered?","history":[]}'
+```
+
+然后打开浏览器 → Langfuse Dashboard → 左侧 **Traces**，检查：
+
+- [ ] 出现一条名为 `rag-chat-answer` 的 Trace
+- [ ] 点开后下挂 3 个 Span：`retrieve` / `build_prompt` / `llm_generate`
+- [ ] `retrieve` Span 的 output 包含文件名 + 页码
+- [ ] `llm_generate` Span 的 output 是完整回答文本（不为空）
+- [ ] `llm_generate` Span 右侧显示 token 用量（input / output tokens）
+
+**测试 2 — Langfuse 流式 Trace**
+
+```powershell
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/stream" -ContentType "application/json" -Body '{"message":"What is the vision coverage?","history":[]}'
+```
+
+Langfuse → Traces：
+
+- [ ] 出现 `rag-chat-stream` Trace，`llm_generate` Span 有完整输出（不是空的）
+
+**测试 3 — Langfuse 挂掉不影响主链路**
+
+1. 用编辑器打开 `.env`，在 `LANGFUSE_PUBLIC_KEY` 这行行首加 `#` 注释掉它，保存
+2. 重启容器：`docker compose up -d`
+3. 再发一次请求，确认正常返回答案：
+
+```powershell
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/answer" -ContentType "application/json" -Body '{"message":"What dental benefits are covered?","history":[]}'
+```
+
+4. 查看后端日志确认无 Exception：`docker compose logs backend --tail 20`
+5. 测完后把 `#` 去掉恢复配置，再重启：`docker compose up -d`
+
+- [ ] 无 Langfuse key 时请求正常返回，日志无 Exception
+
+**测试 4 — RAGAS 评估跑通**
+
+确保第二步的 `eval_dataset.json` 已填写完毕，然后运行：
+
+```powershell
 docker exec rag-backend python scripts/evaluate.py --dataset data/eval_dataset.json --top-k 5
 ```
 
-预期：
+- [ ] 控制台输出三个维度分数（0~1 之间的数字，不是 N/A 或 NaN）
+- [ ] 项目目录 `data/` 下生成 `eval_results_YYYYMMDD_HHMMSS.json` 文件
 
-- [ ] 控制台输出三个维度分数（0~1 之间的数字，不是 N/A）
-- [ ] `data/eval_results_YYYYMMDD_HHMMSS.json` 文件生成
+**测试 5 — RAGAS 调参对比（可选，验证 chunk_size 影响检索质量）**
 
-**测试 2：调参对比**
-
-```bash
-# 第一次：默认 chunk_size=400
-docker exec rag-backend python scripts/evaluate.py  # 记录 context_precision 分数
-
-# 修改 prepdocs.py 默认 chunk_size 为 300，重新 ingest
-docker exec rag-backend python scripts/prepdocs.py --input-dir data --pattern "test*.pdf" --chunk-size 300
-
-# 第二次跑评估
-docker exec rag-backend python scripts/evaluate.py  # 对比 context_precision 分数
+```powershell
+docker exec rag-backend python scripts/evaluate.py --dataset data/eval_dataset.json --top-k 5
 ```
 
-预期：两次 `context_precision` 数值不同（说明参数确实影响了检索质量）。
+记录上面输出的 `context_precision` 分数，然后用 chunk_size=300 重新入库再评估：
+
+```powershell
+docker exec rag-backend python scripts/prepdocs.py --input-dir data --pattern "test*.pdf" --chunk-size 300
+```
+
+```powershell
+docker exec rag-backend python scripts/evaluate.py --dataset data/eval_dataset.json --top-k 5
+```
+
+- [ ] 两次 `context_precision` 数值不同（说明参数确实影响了检索质量）
+
+---
 
 ### 常见问题
 
-- **分数全为 NaN** → 检查 `contexts` 字段是否是字符串列表（不能是 dict 列表）
-- **RAGAS 调用 LLM 失败** → 确认 `AZURE_OPENAI_ENDPOINT` / `AZURE_OPENAI_API_KEY` 在容器内可见；`docker exec rag-backend env | grep AZURE`
-- **`No module named 'langchain_openai'`** → 需要先 `docker compose build backend`（新依赖还没装进镜像）
+- **RAGAS 分数全为 NaN** → `data/eval_dataset.json` 的 `ground_truth` 不能为空，必须是真实文本
+- **RAGAS 调用 LLM 失败** → 检查容器内能看到 Azure 配置：`docker exec rag-backend env | grep AZURE`
+- **`No module named 'langchain_openai'`** → 镜像没有新依赖，运行 `docker compose build backend` 再 `docker compose up -d`
+- **Langfuse Trace 没出现** → 等 10~30 秒刷新，Langfuse Cloud 有延迟；也可查后端日志有无 Langfuse 报错
 
 ---
 
