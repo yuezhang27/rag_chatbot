@@ -1,8 +1,9 @@
 """
-LangGraph RAG 编排（Day 10 + Day 12 Semantic Cache）。
+LangGraph RAG 编排（Day 10 + Day 12 Semantic Cache + Day 13 Dual Guardrails）。
 
-状态图：cache_check → [条件] → retrieve → build_prompt → generate → cache_write
-缓存命中时跳过 retrieve/build_prompt/generate，直接到 END。
+状态图：cache_check → [条件] → content_safety_check → [条件] → nemo_guardrails_check → [条件] → retrieve → build_prompt → generate → cache_write
+缓存命中时跳过 guardrails + RAG，直接到 END。
+Guardrails 拒绝时短路到 END，不进入 RAG 链路。
 对外导出 compiled_graph 供 app.py 调用。
 """
 import logging
@@ -37,6 +38,10 @@ class RAGState(TypedDict, total=False):
     cached_response: Optional[str]
     cached_citations: Optional[List[dict]]
     query_embedding: Optional[List[float]]  # for cache_write
+    # Day 13: guardrails fields
+    guardrail_denied: bool
+    denial_message: Optional[str]
+    pii_detected: Optional[list]
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +162,130 @@ def cache_write_node(state: RAGState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Guardrails nodes (Day 13)
+# ---------------------------------------------------------------------------
+
+def content_safety_check_node(state: RAGState) -> dict:
+    """第一层安全检查：Azure AI Content Safety。
+
+    检测 prompt injection、不当内容。
+    任一检查拒绝 → guardrail_denied=True + denial_message。
+    异常或不可用时放行（不阻断主链路）。
+    """
+    try:
+        from scripts.content_safety import (
+            check_prompt_shield, check_content_filter, detect_pii,
+        )
+
+        query = state["query"]
+
+        # 1) Prompt Shields — injection / jailbreak
+        shield_result = check_prompt_shield(query)
+        if not shield_result.get("safe", True):
+            logger.warning("Content Safety DENY (prompt_injection): query=%s", query[:60])
+            return {
+                "guardrail_denied": True,
+                "denial_message": "抱歉，您的请求包含不安全内容，无法处理。",
+            }
+
+        # 2) Content Filtering — Hate / Violence / SelfHarm / Sexual
+        filter_result = check_content_filter(query)
+        if not filter_result.get("safe", True):
+            category = filter_result.get("category", "unknown")
+            logger.warning("Content Safety DENY (content_filter/%s): query=%s", category, query[:60])
+            return {
+                "guardrail_denied": True,
+                "denial_message": "抱歉，该内容不在本系统的服务范围内。",
+            }
+
+        # 3) PII Detection — log warning only, don't hard deny
+        pii_result = detect_pii(query)
+        pii_entities = pii_result.get("entities", [])
+        if pii_entities:
+            logger.warning("PII detected in query: %s", pii_entities)
+
+        return {
+            "guardrail_denied": False,
+            "pii_detected": pii_entities,
+        }
+    except Exception as exc:
+        logger.warning("content_safety_check failed, degrading to allow: %s", exc)
+        return {"guardrail_denied": False}
+
+
+def _content_safety_route(state: RAGState) -> str:
+    """条件边：content_safety denied → END，否则 → nemo_guardrails_check。"""
+    if state.get("guardrail_denied", False):
+        return "denied"
+    return "allowed"
+
+
+def nemo_guardrails_check_node(state: RAGState) -> dict:
+    """第二层安全检查：NeMo Guardrails（Colang 规则匹配）。
+
+    HR 话题白名单/黑名单，越界问题返回引导话术。
+    异常或不可用时放行。
+    """
+    try:
+        from scripts.content_safety import _is_guardrails_enabled
+        if not _is_guardrails_enabled():
+            return {"guardrail_denied": False}
+
+        from nemoguardrails import RailsConfig, LLMRails
+
+        config_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "guardrails",
+        )
+        config = RailsConfig.from_path(config_path)
+        rails = LLMRails(config)
+
+        query = state["query"]
+        response = rails.generate(messages=[{"role": "user", "content": query}])
+
+        # NeMo returns a response; if it contains a denial message from our Colang rules,
+        # treat it as denied
+        bot_message = ""
+        if isinstance(response, dict):
+            bot_message = response.get("content", "")
+        elif isinstance(response, list):
+            for msg in response:
+                if msg.get("role") == "assistant":
+                    bot_message = msg.get("content", "")
+                    break
+
+        # Check if the response matches any of our denial patterns
+        denial_patterns = [
+            "建议您直接联系 HR 部门讨论薪资事宜",
+            "建议您联系法务部门获取专业法律意见",
+            "出于隐私保护，本系统无法提供他人个人信息",
+            "超出了 HR 政策和合规范围",
+        ]
+        for pattern in denial_patterns:
+            if pattern in bot_message:
+                logger.warning("NeMo Guardrails DENY: query=%s response=%s", query[:60], bot_message[:80])
+                return {
+                    "guardrail_denied": True,
+                    "denial_message": bot_message,
+                }
+
+        return {"guardrail_denied": False}
+    except ImportError:
+        logger.warning("nemoguardrails not installed, skipping NeMo check")
+        return {"guardrail_denied": False}
+    except Exception as exc:
+        logger.warning("nemo_guardrails_check failed, degrading to allow: %s", exc)
+        return {"guardrail_denied": False}
+
+
+def _nemo_route(state: RAGState) -> str:
+    """条件边：nemo denied → END，否则 → retrieve。"""
+    if state.get("guardrail_denied", False):
+        return "denied"
+    return "allowed"
+
+
+# ---------------------------------------------------------------------------
 # Graph nodes
 # ---------------------------------------------------------------------------
 
@@ -226,15 +355,21 @@ def generate_node(state: RAGState) -> dict:
 # ---------------------------------------------------------------------------
 
 def build_rag_graph() -> StateGraph:
-    """构建 RAG 状态图（Day 12: 含缓存分支）。
+    """构建 RAG 状态图（Day 13: 含缓存 + 双层 Guardrails）。
 
     cache_check → [条件边]
-        ├─ cache_hit  → END
-        └─ cache_miss → retrieve → build_prompt → generate → cache_write → END
+        ├─ cache_hit  → END（跳过 guardrails，缓存内容已通过安全检查）
+        └─ cache_miss → content_safety_check → [条件边]
+                          ├─ denied → END
+                          └─ allowed → nemo_guardrails_check → [条件边]
+                                        ├─ denied → END
+                                        └─ allowed → retrieve → build_prompt → generate → cache_write → END
     """
     graph = StateGraph(RAGState)
 
     graph.add_node("cache_check", cache_check_node)
+    graph.add_node("content_safety_check", content_safety_check_node)
+    graph.add_node("nemo_guardrails_check", nemo_guardrails_check_node)
     graph.add_node("retrieve", retrieve_node)
     graph.add_node("build_prompt", build_prompt_node)
     graph.add_node("generate", generate_node)
@@ -244,7 +379,17 @@ def build_rag_graph() -> StateGraph:
     graph.add_conditional_edges(
         "cache_check",
         _cache_route,
-        {"cache_hit": END, "cache_miss": "retrieve"},
+        {"cache_hit": END, "cache_miss": "content_safety_check"},
+    )
+    graph.add_conditional_edges(
+        "content_safety_check",
+        _content_safety_route,
+        {"denied": END, "allowed": "nemo_guardrails_check"},
+    )
+    graph.add_conditional_edges(
+        "nemo_guardrails_check",
+        _nemo_route,
+        {"denied": END, "allowed": "retrieve"},
     )
     graph.add_edge("retrieve", "build_prompt")
     graph.add_edge("build_prompt", "generate")

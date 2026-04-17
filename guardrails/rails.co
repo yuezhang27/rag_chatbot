@@ -1,0 +1,84 @@
+# HR 话题白名单
+define user ask about hr policy
+  "产假可以休多久"
+  "年假怎么计算"
+  "报销流程是什么"
+  "社保缴纳比例"
+  "公积金政策"
+  "考勤规则"
+  "离职流程"
+  "入职需要什么材料"
+  "绩效考核标准"
+  "培训政策"
+  "加班规定"
+  "福利有哪些"
+  "请假怎么申请"
+  "合规要求"
+  "员工手册"
+
+define flow check topic allowed
+  user ask about hr policy
+  $allowed = True
+
+# 黑名单：薪资谈判
+define user ask about salary negotiation
+  "薪资谈判技巧"
+  "怎么跟老板谈加薪"
+  "如何争取更高工资"
+  "salary negotiation"
+  "how to negotiate salary"
+
+define flow salary negotiation denied
+  user ask about salary negotiation
+  bot refuse salary negotiation
+
+define bot refuse salary negotiation
+  "建议您直接联系 HR 部门讨论薪资事宜，本系统无法提供薪资谈判建议。"
+
+# 黑名单：法律咨询
+define user ask about legal advice
+  "法律咨询"
+  "劳动仲裁"
+  "起诉公司"
+  "legal advice"
+  "法律问题"
+  "打官司"
+
+define flow legal advice denied
+  user ask about legal advice
+  bot refuse legal advice
+
+define bot refuse legal advice
+  "建议您联系法务部门获取专业法律意见，本系统不提供法律咨询服务。"
+
+# 黑名单：他人信息
+define user ask about other people info
+  "查一下张三的工资"
+  "李四的绩效"
+  "某某的个人信息"
+  "其他人的薪资"
+  "同事的工资单"
+  "别人的考勤记录"
+
+define flow other people info denied
+  user ask about other people info
+  bot refuse other people info
+
+define bot refuse other people info
+  "出于隐私保护，本系统无法提供他人个人信息。如需查询，请联系 HR 部门并获得相关授权。"
+
+# 黑名单：完全无关话题
+define user ask about unrelated topic
+  "今天天气怎么样"
+  "推荐一部电影"
+  "写一首诗"
+  "帮我写代码"
+  "股票推荐"
+  "美食推荐"
+
+define flow unrelated topic denied
+  user ask about unrelated topic
+  bot refuse unrelated topic
+
+define bot refuse unrelated topic
+  "这个问题超出了 HR 政策和合规范围，建议您联系相关部门获取帮助。"

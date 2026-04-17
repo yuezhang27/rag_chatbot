@@ -345,7 +345,7 @@ THIS IS USED TO TEST LLM WORKS. PLEASE GO TO http://localhost:8000/v1/chat/test
 
 @app.post("/v1/chat/answer", response_model=ChatResponse)
 def chat_answer(request: ChatRequest):
-    """非流式回答（LangGraph 编排版 + Day 12 语义缓存）。"""
+    """非流式回答（LangGraph 编排版 + Day 12 语义缓存 + Day 13 Guardrails）。"""
     conversation_id = create_conversation_if_needed(request.conversation_id)
     lf = _lf()
     trace = None
@@ -361,6 +361,7 @@ def chat_answer(request: ChatRequest):
 
     from scripts.rag_graph import (
         cache_check_node, retrieve_node, build_prompt_node, cache_write_node,
+        content_safety_check_node, nemo_guardrails_check_node,
     )
 
     history_dicts = [{"role": m.role, "content": m.content} for m in (request.history or [])]
@@ -422,7 +423,60 @@ def chat_answer(request: ChatRequest):
         )
         return ChatResponse(conversation_id=conversation_id, answer=answer, citations=citations)
 
-    # ── Cache MISS: full RAG pipeline ─────────────────────────────────────────
+    # ── Day 13: Guardrails (after cache miss) ─────────────────────────────────
+    # Layer 1: Azure Content Safety
+    cs_span = None
+    try:
+        if trace:
+            cs_span = trace.span(name="content_safety_check", input={"query": request.message})
+    except Exception:
+        pass
+
+    cs_result = content_safety_check_node(state)
+    state.update(cs_result)
+
+    if cs_span:
+        try:
+            cs_span.end(output={"guardrail_denied": state.get("guardrail_denied", False)})
+        except Exception:
+            pass
+
+    if state.get("guardrail_denied", False):
+        denial = state.get("denial_message", "抱歉，您的请求无法处理。")
+        if lf:
+            try:
+                lf.flush()
+            except Exception:
+                pass
+        return ChatResponse(conversation_id=conversation_id, answer=denial, citations=[])
+
+    # Layer 2: NeMo Guardrails
+    nemo_span = None
+    try:
+        if trace:
+            nemo_span = trace.span(name="nemo_guardrails_check", input={"query": request.message})
+    except Exception:
+        pass
+
+    nemo_result = nemo_guardrails_check_node(state)
+    state.update(nemo_result)
+
+    if nemo_span:
+        try:
+            nemo_span.end(output={"guardrail_denied": state.get("guardrail_denied", False)})
+        except Exception:
+            pass
+
+    if state.get("guardrail_denied", False):
+        denial = state.get("denial_message", "这个问题超出了 HR 政策和合规范围，建议您联系相关部门获取帮助。")
+        if lf:
+            try:
+                lf.flush()
+            except Exception:
+                pass
+        return ChatResponse(conversation_id=conversation_id, answer=denial, citations=[])
+
+    # ── Cache MISS + Guardrails PASS: full RAG pipeline ───────────────────────
     r_span = None
     bp_span = None
     gen_span = None
@@ -534,10 +588,11 @@ def chat_answer(request: ChatRequest):
 
 @app.post("/v1/chat/stream")
 def chat_stream(request: ChatRequest):
-    """流式主接口（SSE）— LangGraph 编排版 + Day 12 语义缓存。
+    """流式主接口（SSE）— LangGraph 编排版 + Day 12 语义缓存 + Day 13 Guardrails。
 
     协议不变：citation_data → response_text → done。
     缓存命中时 response_text 一次性发完（非逐字流式）。
+    被拒绝时 SSE 返回空 citations + 拒答提示。
     """
     conversation_id = create_conversation_if_needed(request.conversation_id)
     lf = _lf()
@@ -554,6 +609,7 @@ def chat_stream(request: ChatRequest):
 
     from scripts.rag_graph import (
         cache_check_node, retrieve_node, build_prompt_node, cache_write_node,
+        content_safety_check_node, nemo_guardrails_check_node,
     )
 
     history_dicts = [{"role": m.role, "content": m.content} for m in (request.history or [])]
@@ -622,7 +678,72 @@ def chat_stream(request: ChatRequest):
 
         return StreamingResponse(cached_event_generator(), media_type="text/event-stream")
 
-    # ── Cache MISS: full RAG pipeline ─────────────────────────────────────────
+    # ── Day 13: Guardrails (after cache miss) ─────────────────────────────────
+    # Layer 1: Azure Content Safety
+    cs_span = None
+    try:
+        if trace:
+            cs_span = trace.span(name="content_safety_check", input={"query": request.message})
+    except Exception:
+        pass
+
+    cs_result = content_safety_check_node(state)
+    state.update(cs_result)
+
+    if cs_span:
+        try:
+            cs_span.end(output={"guardrail_denied": state.get("guardrail_denied", False)})
+        except Exception:
+            pass
+
+    if state.get("guardrail_denied", False):
+        denial = state.get("denial_message", "抱歉，您的请求无法处理。")
+
+        def denied_cs_generator():
+            yield _sse_event("citation_data", {"citations": []})
+            yield _sse_event("response_text", {"text": denial})
+            yield _sse_event("done", {"conversation_id": conversation_id})
+            if lf:
+                try:
+                    lf.flush()
+                except Exception:
+                    pass
+
+        return StreamingResponse(denied_cs_generator(), media_type="text/event-stream")
+
+    # Layer 2: NeMo Guardrails
+    nemo_span = None
+    try:
+        if trace:
+            nemo_span = trace.span(name="nemo_guardrails_check", input={"query": request.message})
+    except Exception:
+        pass
+
+    nemo_result = nemo_guardrails_check_node(state)
+    state.update(nemo_result)
+
+    if nemo_span:
+        try:
+            nemo_span.end(output={"guardrail_denied": state.get("guardrail_denied", False)})
+        except Exception:
+            pass
+
+    if state.get("guardrail_denied", False):
+        denial = state.get("denial_message", "这个问题超出了 HR 政策和合规范围，建议您联系相关部门获取帮助。")
+
+        def denied_nemo_generator():
+            yield _sse_event("citation_data", {"citations": []})
+            yield _sse_event("response_text", {"text": denial})
+            yield _sse_event("done", {"conversation_id": conversation_id})
+            if lf:
+                try:
+                    lf.flush()
+                except Exception:
+                    pass
+
+        return StreamingResponse(denied_nemo_generator(), media_type="text/event-stream")
+
+    # ── Cache MISS + Guardrails PASS: full RAG pipeline ───────────────────────
     # 1) Retrieve
     r_span = None
     try:
