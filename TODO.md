@@ -437,3 +437,161 @@ Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/feedback" -Content
 - **Azure AI Search 报维度不匹配** → 需要在 Azure Portal 删除旧索引后重新 ingest
 - **GPT-4o deployment 不存在** → 检查 Azure Portal 是否已部署 gpt-4o，确认 `.env` 中 `AZURE_OPENAI_CHAT_DEPLOYMENT` 名称正确
 - **SSE 输出为空** → 检查 LangChain streaming 的 `chunk.content` 提取，确认 `AzureChatOpenAI` 的 `streaming=True` 已设置
+
+---
+
+## Day 11 — 文档解析升级（Azure Document Intelligence）
+
+### 需要配置
+
+#### A. 创建 Azure Document Intelligence 资源
+
+1. Azure Portal → 创建资源 → 搜索 "Document Intelligence" → 创建
+2. 选择区域（建议与 OpenAI 同区域，如 Sweden Central）
+3. 定价层选 S0（标准）
+4. 创建完成后，进入资源 → Keys and Endpoint → 复制 Endpoint 和 Key
+
+#### B. 配置 `.env`
+
+在 `.env` 中添加以下两行：
+
+```
+AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT=https://your-resource.cognitiveservices.azure.com/
+AZURE_DOCUMENT_INTELLIGENCE_KEY=your_key_here
+```
+
+#### C. 用 Document Intelligence 重新 ingest
+
+```powershell
+# 无新依赖，不需要重新 build（azure-ai-documentintelligence 已在 requirements.txt 中）
+docker compose up -d
+
+# 用 Azure Document Intelligence 解析器重新入库
+docker exec rag-backend python scripts/prepdocs.py --input-dir data --pattern "test*.pdf" --parser azure
+```
+
+> **注意**：如果之前用 `--parser local` 入过库，建议先清空索引再重新入库，避免重复 chunk。
+> - Azure AI Search：在 Azure Portal 删除 `hr-documents` 索引，代码会自动重建
+> - ChromaDB：删除 `chroma_db/` 目录
+
+---
+
+### E2E 测试
+
+**测试 1：Document Intelligence 解析验证（表格提取）**
+
+```powershell
+# 用一份含表格的 HR PDF 测试解析质量
+docker exec rag-backend python -c "
+from scripts.prepdocs.pdfparser import parse_pdf_pages
+from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv()
+content = Path('data/test_benefits.pdf').read_bytes()
+pages = parse_pdf_pages(content, filename='test_benefits.pdf', backend='azure')
+for pn, text in pages:
+    print(f'=== Page {pn} ===')
+    print(text[:500])
+    print()
+"
+```
+
+预期：
+- [ ] 输出中表格部分显示为 Markdown 格式（`| header | header |` + `|---|---|` + 数据行）
+- [ ] 普通文本段落正常显示
+
+**测试 2：对比 PyMuPDF vs Document Intelligence 提取质量**
+
+```powershell
+# 用 local parser 提取同一文件（对比用）
+docker exec rag-backend python -c "
+from scripts.prepdocs.pdfparser import parse_pdf_pages
+from pathlib import Path
+content = Path('data/test_benefits.pdf').read_bytes()
+pages = parse_pdf_pages(content, filename='test_benefits.pdf', backend='local')
+for pn, text in pages:
+    print(f'=== Page {pn} (local) ===')
+    print(text[:500])
+    print()
+"
+```
+
+预期：
+- [ ] local 输出的表格是乱文本（列错位、换行混乱）
+- [ ] azure 输出的表格是结构化 Markdown（上面测试 1 已验证）
+
+**测试 3：全量 ingest 跑通**
+
+```powershell
+docker exec rag-backend python scripts/prepdocs.py --input-dir data --pattern "test*.pdf" --parser azure
+```
+
+预期：
+- [ ] 无未处理异常
+- [ ] 输出显示每个文件的 sqlite_chunks 和 index_chunks 数量
+
+**测试 4：表格相关问题检索验证**
+
+```powershell
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/answer" -ContentType "application/json" -Body '{"message":"What is the annual maximum for dental insurance?","history":[]}'
+```
+
+预期：
+- [ ] 回答准确（能从表格中提取具体数字）
+- [ ] 引用格式正确（来源：xxx.pdf，第 X 页）
+
+**测试 5：非流式 + 流式接口回归**
+
+```powershell
+# 非流式
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/answer" -ContentType "application/json" -Body '{"message":"What dental benefits are covered?","history":[]}'
+
+# 流式
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/stream" -ContentType "application/json" -Body '{"message":"What is the vision coverage?","history":[]}'
+```
+
+预期：
+- [ ] 非流式正常返回，包含 citations
+- [ ] 流式 SSE 顺序不变：`citation_data` → `response_text` → `done`
+
+**测试 6：RAGAS 评估对比**
+
+```powershell
+# 跑 RAGAS 评估
+docker exec rag-backend python scripts/evaluate.py --dataset data/eval_dataset.json --top-k 5
+```
+
+预期：
+- [ ] 三个维度分数正常（0~1 之间，不是 NaN）
+- [ ] 与 Day 10 基线对比记录（预期 Context Precision 因表格提取改善而提升）
+
+**测试 7：已有功能回归**
+
+- [ ] 前端 http://localhost:3000 正常加载
+- [ ] 发消息 → 正常回答
+- [ ] 👎 按钮正常
+- [ ] feedback 接口：`Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/feedback" -ContentType "application/json" -Body '{"conversation_id":"test-123","message_index":1}'` → 返回 `{"ok": true}`
+
+**测试 8：DI 未配置时明确报错**
+
+```powershell
+# 临时注释掉 .env 中的 AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT，重启
+docker compose up -d
+
+# 尝试用 azure parser — 应该报错
+docker exec rag-backend python scripts/prepdocs.py --input-dir data --pattern "test*.pdf" --parser azure
+```
+
+预期：
+- [ ] 报错信息明确提示需要配置 `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` 和 `AZURE_DOCUMENT_INTELLIGENCE_KEY`
+- [ ] 不会静默 fallback 到 PyMuPDF
+
+---
+
+### 常见问题
+
+- **Document Intelligence 返回 401** → 检查 `AZURE_DOCUMENT_INTELLIGENCE_KEY` 是否正确；确认资源已创建完成
+- **分析超时** → 默认 120s polling timeout；大文件（>50 页）可能需要更久，可在代码中调整 `_DI_POLLING_TIMEOUT`
+- **表格 Markdown 格式不对** → 检查 `_table_to_markdown` 中 row_index/column_index 处理；有合并单元格时可能需要调试
+- **ingest 后检索不到表格内容** → 确认表格 Markdown 写入了 chunk（可查 SQLite docs 表或直接查索引）
+- **用 local parser 不受影响** → `--parser local` 仍然走 PyMuPDF，不需要 DI 凭据
