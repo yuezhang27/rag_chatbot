@@ -1,9 +1,11 @@
 """
-LangGraph RAG 编排（Day 10）。
+LangGraph RAG 编排（Day 10 + Day 12 Semantic Cache）。
 
-线性状态图：retrieve → build_prompt → generate
+状态图：cache_check → [条件] → retrieve → build_prompt → generate → cache_write
+缓存命中时跳过 retrieve/build_prompt/generate，直接到 END。
 对外导出 compiled_graph 供 app.py 调用。
 """
+import logging
 import os
 from typing import Any, List, Optional
 
@@ -11,6 +13,8 @@ from langgraph.graph import StateGraph, START, END
 from typing_extensions import TypedDict
 
 from scripts.search_client import get_search_client
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -28,6 +32,11 @@ class RAGState(TypedDict, total=False):
     citations: List[dict]              # [{filename, page, snippet}]
     prompt_messages: List[dict]        # final messages list for LLM
     response: str                      # full generated text
+    # Day 12: cache fields
+    cache_hit: bool
+    cached_response: Optional[str]
+    cached_citations: Optional[List[dict]]
+    query_embedding: Optional[List[float]]  # for cache_write
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +93,67 @@ def _make_snippet(text: str, max_chars: int = 120) -> str:
     if last_space > max_chars // 2:
         truncated = truncated[:last_space]
     return truncated + "…"
+
+
+# ---------------------------------------------------------------------------
+# Cache nodes (Day 12)
+# ---------------------------------------------------------------------------
+
+def cache_check_node(state: RAGState) -> dict:
+    """缓存检查节点：计算 query embedding → Redis 语义查找。
+
+    命中时写入 cached_response + cached_citations + cache_hit=True。
+    未命中或异常时 cache_hit=False。
+    """
+    try:
+        from scripts.cache import cache_lookup
+        from scripts.chroma_embed import embed_texts_batch
+
+        query = state["query"]
+        embeddings = embed_texts_batch([query])
+        query_embedding = embeddings[0]
+
+        cached = cache_lookup(query_embedding)
+        if cached is not None:
+            return {
+                "cache_hit": True,
+                "cached_response": cached["response"],
+                "cached_citations": cached.get("citations", []),
+                "query_embedding": query_embedding,
+                "response": cached["response"],
+                "citations": cached.get("citations", []),
+            }
+        return {
+            "cache_hit": False,
+            "query_embedding": query_embedding,
+        }
+    except Exception as exc:
+        logger.warning("cache_check failed, degrading to miss: %s", exc)
+        return {"cache_hit": False}
+
+
+def _cache_route(state: RAGState) -> str:
+    """条件边：cache_hit=True → END，否则 → retrieve。"""
+    if state.get("cache_hit", False):
+        return "cache_hit"
+    return "cache_miss"
+
+
+def cache_write_node(state: RAGState) -> dict:
+    """缓存回写节点：将 RAG 结果写入 Redis。写入失败不阻塞。"""
+    try:
+        from scripts.cache import cache_store
+
+        query = state.get("query", "")
+        query_embedding = state.get("query_embedding")
+        response = state.get("response", "")
+        citations = state.get("citations", [])
+
+        if query_embedding and response:
+            cache_store(query, query_embedding, response, citations)
+    except Exception as exc:
+        logger.warning("cache_write failed: %s", exc)
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -156,17 +226,30 @@ def generate_node(state: RAGState) -> dict:
 # ---------------------------------------------------------------------------
 
 def build_rag_graph() -> StateGraph:
-    """构建 RAG 线性状态图：retrieve → build_prompt → generate。"""
+    """构建 RAG 状态图（Day 12: 含缓存分支）。
+
+    cache_check → [条件边]
+        ├─ cache_hit  → END
+        └─ cache_miss → retrieve → build_prompt → generate → cache_write → END
+    """
     graph = StateGraph(RAGState)
 
+    graph.add_node("cache_check", cache_check_node)
     graph.add_node("retrieve", retrieve_node)
     graph.add_node("build_prompt", build_prompt_node)
     graph.add_node("generate", generate_node)
+    graph.add_node("cache_write", cache_write_node)
 
-    graph.add_edge(START, "retrieve")
+    graph.add_edge(START, "cache_check")
+    graph.add_conditional_edges(
+        "cache_check",
+        _cache_route,
+        {"cache_hit": END, "cache_miss": "retrieve"},
+    )
     graph.add_edge("retrieve", "build_prompt")
     graph.add_edge("build_prompt", "generate")
-    graph.add_edge("generate", END)
+    graph.add_edge("generate", "cache_write")
+    graph.add_edge("cache_write", END)
 
     return graph
 

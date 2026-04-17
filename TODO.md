@@ -595,3 +595,161 @@ docker exec rag-backend python scripts/prepdocs.py --input-dir data --pattern "t
 - **表格 Markdown 格式不对** → 检查 `_table_to_markdown` 中 row_index/column_index 处理；有合并单元格时可能需要调试
 - **ingest 后检索不到表格内容** → 确认表格 Markdown 写入了 chunk（可查 SQLite docs 表或直接查索引）
 - **用 local parser 不受影响** → `--parser local` 仍然走 PyMuPDF，不需要 DI 凭据
+
+---
+
+## Day 12 — Semantic Cache（Redis）
+
+### 需要配置
+
+#### A. 配置 `.env`
+
+在 `.env` 中添加以下行：
+
+```
+REDIS_URL=redis://redis:6379
+CACHE_SIMILARITY_THRESHOLD=0.95
+CACHE_ENABLED=true
+```
+
+> `REDIS_URL` 指向 Docker Compose 中的 Redis 服务名 `redis`。
+> `CACHE_SIMILARITY_THRESHOLD` 控制语义相似度阈值（0.95 = 非常相似才命中）。
+> `CACHE_ENABLED=false` 可关闭缓存用于调试。
+
+#### B. 重新构建并启动
+
+```powershell
+# Day 12 新增了 redis 依赖 + Redis 容器
+docker compose build backend
+docker compose up -d
+
+# 确认 Redis 容器正常运行
+docker compose ps
+# 应看到 rag-redis 状态为 running
+```
+
+---
+
+### E2E 测试
+
+**测试 1：首次问题走完整 RAG 链路（缓存 MISS）**
+
+```powershell
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/answer" -ContentType "application/json" -Body '{"message":"How many days of maternity leave are allowed?","history":[]}'
+```
+
+预期：
+- [ ] 正常返回回答，包含引用
+- [ ] Langfuse trace 有 `cache_check`、`retrieve`、`build_prompt`、`llm_generate` span
+- [ ] Langfuse trace metadata 显示 `cache_hit: false`
+
+**测试 2：相似问题缓存命中（缓存 HIT）**
+
+```powershell
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/answer" -ContentType "application/json" -Body '{"message":"How many days of maternity leave are allowed?","history":[]}'
+```
+
+预期：
+- [ ] 正常返回回答，内容与测试 1 一致
+- [ ] 响应速度明显快于测试 1（跳过了检索和 LLM）
+- [ ] Langfuse trace 只有 `cache_check` span（无 `retrieve`/`llm_generate`）
+- [ ] Langfuse trace metadata 显示 `cache_hit: true`
+
+**测试 3：流式接口缓存命中**
+
+先用流式接口发一条新问题（缓存 MISS），再发同一问题（缓存 HIT）：
+
+```powershell
+# 第一次（MISS）
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/stream" -ContentType "application/json" -Body '{"message":"What is the vision coverage?","history":[]}'
+
+# 第二次（HIT）
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/stream" -ContentType "application/json" -Body '{"message":"What is the vision coverage?","history":[]}'
+```
+
+预期：
+- [ ] 两次 SSE 事件顺序都是 `citation_data` → `response_text` → `done`
+- [ ] 第二次返回内容与第一次一致
+- [ ] 第二次速度明显更快
+
+**测试 4：语义差异大的问题不误命中**
+
+```powershell
+# 先问一个问题
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/answer" -ContentType "application/json" -Body '{"message":"What dental benefits are covered?","history":[]}'
+
+# 再问一个完全不同的问题
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/answer" -ContentType "application/json" -Body '{"message":"How does the 401k matching work?","history":[]}'
+```
+
+预期：
+- [ ] 第二个问题不应命中第一个的缓存（回答内容不同）
+
+**测试 5：Redis 挂掉后降级为无缓存模式**
+
+```powershell
+# 停掉 Redis
+docker compose stop redis
+
+# 发请求 — 应正常返回（走完整 RAG 链路）
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/answer" -ContentType "application/json" -Body '{"message":"What dental benefits are covered?","history":[]}'
+
+# 查看后端日志，确认有 Redis 警告但无异常
+docker compose logs backend --tail 20
+
+# 恢复 Redis
+docker compose start redis
+```
+
+预期：
+- [ ] 请求正常返回，回答正确
+- [ ] 后端日志有 `Redis not available` 警告，无 Exception/500
+- [ ] 恢复 Redis 后缓存功能自动恢复
+
+**测试 6：CACHE_ENABLED=false 关闭缓存**
+
+```powershell
+# 在 .env 中改为 CACHE_ENABLED=false，重启
+docker compose up -d
+
+# 发两次相同请求
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/answer" -ContentType "application/json" -Body '{"message":"What dental benefits are covered?","history":[]}'
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/answer" -ContentType "application/json" -Body '{"message":"What dental benefits are covered?","history":[]}'
+```
+
+预期：
+- [ ] 两次都走完整 RAG 链路（Langfuse trace 都有 retrieve/llm_generate）
+- [ ] 测完后改回 `CACHE_ENABLED=true`，重启
+
+**测试 7：已有功能回归**
+
+- [ ] 前端 http://localhost:3000 正常加载
+- [ ] 发消息 → 正常回答
+- [ ] 👎 按钮正常
+- [ ] feedback 接口正常：
+
+```powershell
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/feedback" -ContentType "application/json" -Body '{"conversation_id":"test-123","message_index":1}'
+```
+
+预期：返回 `{"ok": true}`
+
+**测试 8：手动查看 Redis 中的缓存数据（可选）**
+
+```powershell
+docker exec rag-redis redis-cli KEYS "rag:cache:*"
+# 应列出缓存条目
+
+docker exec rag-redis redis-cli GET "rag:cache:xxxx"
+# 应返回 JSON，包含 query、response、citations、embedding
+```
+
+---
+
+### 常见问题
+
+- **所有请求都显示 MISS** → 检查 Redis 是否可达：`docker exec rag-redis redis-cli PING`；检查 `.env` 中 `REDIS_URL` 是否正确（Docker 内用 `redis://redis:6379`）
+- **误命中（答案不对）** → 降低 `CACHE_SIMILARITY_THRESHOLD`（如改为 0.98）
+- **几乎不命中** → 提高 `CACHE_SIMILARITY_THRESHOLD`（如改为 0.90）；确认 embedding 模型一致
+- **Redis 容器启动失败** → 检查 6379 端口是否被占用：`netstat -ano | findstr 6379`
+- **缓存命中但 SSE 为空** → 检查 `cached_response` 字段是否正确传递到 event_generator

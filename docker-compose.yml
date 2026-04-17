@@ -13,6 +13,14 @@ services:
       - ./:/app
       - ./data:/app/data:ro
       - ./chroma_db:/app/chroma_db
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    container_name: rag-redis
+    ports:
+      - "6379:6379"
 
   frontend:
     build: ./frontend

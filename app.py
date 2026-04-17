@@ -345,11 +345,7 @@ THIS IS USED TO TEST LLM WORKS. PLEASE GO TO http://localhost:8000/v1/chat/test
 
 @app.post("/v1/chat/answer", response_model=ChatResponse)
 def chat_answer(request: ChatRequest):
-    """非流式回答（LangGraph 编排版）。
-
-    Day10：三步手写调用迁移为 compiled_graph.invoke()。
-    Langfuse tracing 通过 graph node 前后的 span 手动打点保留。
-    """
+    """非流式回答（LangGraph 编排版 + Day 12 语义缓存）。"""
     conversation_id = create_conversation_if_needed(request.conversation_id)
     lf = _lf()
     trace = None
@@ -363,9 +359,12 @@ def chat_answer(request: ChatRequest):
     except Exception:
         pass
 
-    # ── 用 LangGraph 跑完整 RAG 链路 ─────────────────────────────────────────
+    from scripts.rag_graph import (
+        cache_check_node, retrieve_node, build_prompt_node, cache_write_node,
+    )
+
     history_dicts = [{"role": m.role, "content": m.content} for m in (request.history or [])]
-    graph_input: dict = {
+    state: dict = {
         "query": request.message,
         "history": history_dicts,
         "conversation_id": conversation_id,
@@ -373,7 +372,57 @@ def chat_answer(request: ChatRequest):
         "use_retrieval": request.use_retrieval,
     }
 
-    # Langfuse: retrieve span
+    # ── 0) Cache check ───────────────────────────────────────────────────────
+    cache_span = None
+    try:
+        if trace:
+            cache_span = trace.span(name="cache_check", input={"query": request.message})
+    except Exception:
+        pass
+
+    cache_result = cache_check_node(state)
+    state.update(cache_result)
+    cache_hit = state.get("cache_hit", False)
+
+    if cache_span:
+        try:
+            cache_span.end(output={"cache_hit": cache_hit})
+        except Exception:
+            pass
+
+    # Update trace metadata with cache status
+    if trace:
+        try:
+            trace.update(metadata={"conversation_id": conversation_id, "cache_hit": cache_hit})
+        except Exception:
+            pass
+
+    if cache_hit:
+        # ── Cache HIT: return cached response directly ────────────────────────
+        answer = state.get("cached_response", state.get("response", ""))
+        cached_citations = state.get("cached_citations", state.get("citations", []))
+        citations = [
+            Citation(
+                filename=c.get("filename", "unknown"),
+                page=int(c.get("page", 0) or 0),
+                snippet=c.get("snippet", ""),
+            )
+            for c in cached_citations
+        ]
+        if lf:
+            try:
+                lf.flush()
+            except Exception:
+                pass
+        _save_conversation_to_blob(
+            conversation_id=conversation_id,
+            history=request.history or [],
+            answer=answer,
+            citations=citations,
+        )
+        return ChatResponse(conversation_id=conversation_id, answer=answer, citations=citations)
+
+    # ── Cache MISS: full RAG pipeline ─────────────────────────────────────────
     r_span = None
     bp_span = None
     gen_span = None
@@ -384,10 +433,6 @@ def chat_answer(request: ChatRequest):
         pass
 
     try:
-        # Step through nodes for Langfuse observability
-        # 1) Retrieve
-        from scripts.rag_graph import retrieve_node, build_prompt_node
-        state = dict(graph_input)
         retrieve_result = retrieve_node(state)
         state.update(retrieve_result)
 
@@ -400,7 +445,6 @@ def chat_answer(request: ChatRequest):
             except Exception:
                 pass
 
-        # 2) Build prompt
         try:
             if trace:
                 bp_span = trace.span(name="build_prompt", input={"docs_count": len(state.get("contexts", []))})
@@ -417,7 +461,6 @@ def chat_answer(request: ChatRequest):
             except Exception:
                 pass
 
-        # 3) Generate (via LangChain AzureChatOpenAI)
         deployment = get_chat_deployment()
         try:
             if trace:
@@ -439,6 +482,7 @@ def chat_answer(request: ChatRequest):
         )
         result = llm.invoke(state["prompt_messages"])
         answer = result.content or ""
+        state["response"] = answer
 
         if gen_span:
             try:
@@ -454,8 +498,10 @@ def chat_answer(request: ChatRequest):
             except Exception:
                 pass
 
+        # Cache write
+        cache_write_node(state)
+
     except Exception as exc:
-        # Close any open spans on error
         for s in (r_span, bp_span):
             if s:
                 try:
@@ -483,19 +529,15 @@ def chat_answer(request: ChatRequest):
         answer=answer,
         citations=citations,
     )
-    return ChatResponse(
-        conversation_id=conversation_id,
-        answer=answer,
-        citations=citations,
-    )
+    return ChatResponse(conversation_id=conversation_id, answer=answer, citations=citations)
 
 
 @app.post("/v1/chat/stream")
 def chat_stream(request: ChatRequest):
-    """流式主接口（SSE）— LangGraph 编排版。
+    """流式主接口（SSE）— LangGraph 编排版 + Day 12 语义缓存。
 
-    Day10：retrieve + build_prompt 由 graph node 执行，generate 用 LangChain streaming。
     协议不变：citation_data → response_text → done。
+    缓存命中时 response_text 一次性发完（非逐字流式）。
     """
     conversation_id = create_conversation_if_needed(request.conversation_id)
     lf = _lf()
@@ -510,8 +552,9 @@ def chat_stream(request: ChatRequest):
     except Exception:
         pass
 
-    # ── LangGraph: retrieve + build_prompt nodes ─────────────────────────────
-    from scripts.rag_graph import retrieve_node, build_prompt_node
+    from scripts.rag_graph import (
+        cache_check_node, retrieve_node, build_prompt_node, cache_write_node,
+    )
 
     history_dicts = [{"role": m.role, "content": m.content} for m in (request.history or [])]
     state: dict = {
@@ -522,6 +565,64 @@ def chat_stream(request: ChatRequest):
         "use_retrieval": request.use_retrieval,
     }
 
+    # ── 0) Cache check ───────────────────────────────────────────────────────
+    cache_span = None
+    try:
+        if trace:
+            cache_span = trace.span(name="cache_check", input={"query": request.message})
+    except Exception:
+        pass
+
+    cache_result = cache_check_node(state)
+    state.update(cache_result)
+    cache_hit = state.get("cache_hit", False)
+
+    if cache_span:
+        try:
+            cache_span.end(output={"cache_hit": cache_hit})
+        except Exception:
+            pass
+
+    if trace:
+        try:
+            trace.update(metadata={"conversation_id": conversation_id, "cache_hit": cache_hit})
+        except Exception:
+            pass
+
+    if cache_hit:
+        # ── Cache HIT: send cached response as SSE ────────────────────────────
+        cached_answer = state.get("cached_response", state.get("response", ""))
+        cached_cits = state.get("cached_citations", state.get("citations", []))
+
+        def cached_event_generator():
+            citations = [
+                Citation(
+                    filename=c.get("filename", "unknown"),
+                    page=int(c.get("page", 0) or 0),
+                    snippet=c.get("snippet", ""),
+                )
+                for c in cached_cits
+            ]
+            yield _sse_event("citation_data", {"citations": [c.dict() for c in citations]})
+            yield _sse_event("response_text", {"text": cached_answer})
+            yield _sse_event("done", {"conversation_id": conversation_id})
+
+            if lf:
+                try:
+                    lf.flush()
+                except Exception:
+                    pass
+
+            _save_conversation_to_blob(
+                conversation_id=conversation_id,
+                history=request.history or [],
+                answer=cached_answer,
+                citations=citations,
+            )
+
+        return StreamingResponse(cached_event_generator(), media_type="text/event-stream")
+
+    # ── Cache MISS: full RAG pipeline ─────────────────────────────────────────
     # 1) Retrieve
     r_span = None
     try:
@@ -609,6 +710,10 @@ def chat_stream(request: ChatRequest):
                     pass
 
         yield _sse_event("done", {"conversation_id": conversation_id})
+
+        # Cache write after generation complete
+        state["response"] = full_text
+        cache_write_node(state)
 
         _save_conversation_to_blob(
             conversation_id=conversation_id,
