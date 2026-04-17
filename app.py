@@ -14,6 +14,7 @@ from openai import AzureOpenAI
 from pydantic import BaseModel
 
 from scripts.search_client import get_search_client
+from scripts.rag_graph import compiled_graph, SYSTEM_PROMPT as _GRAPH_SYSTEM_PROMPT
 
 load_dotenv()
 
@@ -227,7 +228,7 @@ def get_client():
 
 
 def get_chat_deployment() -> str:
-    return os.environ.get("AZURE_OPENAI_CHAT_DEPLOYMENT", "gpt-4o-mini")
+    return os.environ.get("AZURE_OPENAI_CHAT_DEPLOYMENT", "gpt-4o")
 
 
 def create_conversation_if_needed(conversation_id: Optional[str]) -> str:
@@ -261,13 +262,8 @@ def create_conversation_if_needed(conversation_id: Optional[str]) -> str:
 #     ...
 
 
-SYSTEM_PROMPT = """你是企业 HR 知识库助手。
-
-【回答规则】
-1. 只基于下方用户消息中提供的 <context> 内容回答，禁止使用任何外部知识推断或编造。
-2. 如果 <context> 中没有足够信息支持答案，必须明确说"根据现有资料无法确认"，不得猜测。
-3. 回答时如引用具体内容，请在句末标注来源，格式为：（来源：文件名，第 X 页）。
-4. 回答语言跟随用户提问语言（中文问则中文答，英文问则英文答）。"""
+# Day10: SYSTEM_PROMPT 统一定义在 rag_graph.py，此处保留别名以兼容
+SYSTEM_PROMPT = _GRAPH_SYSTEM_PROMPT
 
 
 def build_prompt(message: str, docs: List[Union[sqlite3.Row, dict]]) -> str:
@@ -349,9 +345,10 @@ THIS IS USED TO TEST LLM WORKS. PLEASE GO TO http://localhost:8000/v1/chat/test
 
 @app.post("/v1/chat/answer", response_model=ChatResponse)
 def chat_answer(request: ChatRequest):
-    """非流式回答（用于快速调试）。
+    """非流式回答（LangGraph 编排版）。
 
-    Day4 主路线是 `/v1/chat/stream`，但保留该接口用于本地验证 RAG 基本闭环。
+    Day10：三步手写调用迁移为 compiled_graph.invoke()。
+    Langfuse tracing 通过 graph node 前后的 span 手动打点保留。
     """
     conversation_id = create_conversation_if_needed(request.conversation_id)
     lf = _lf()
@@ -366,74 +363,105 @@ def chat_answer(request: ChatRequest):
     except Exception:
         pass
 
-    # ── Retrieval ────────────────────────────────────────────────────────────
-    retrieved: List[dict] = []
-    if request.use_retrieval:
-        try:
-            if trace:
-                span = trace.span(name="retrieve", input={"query": request.message})
-            retrieved = get_search_client().search(request.message, top_k=request.top_k)
-            if trace:
-                span.end(output={
-                    "chunks_count": len(retrieved),
-                    "sources": [{"title": d.get("title"), "page": d.get("page")} for d in retrieved],
-                })
-        except Exception as exc:
-            if trace:
-                try:
-                    span.end(output={"error": str(exc)})
-                except Exception:
-                    pass
-            raise
+    # ── 用 LangGraph 跑完整 RAG 链路 ─────────────────────────────────────────
+    history_dicts = [{"role": m.role, "content": m.content} for m in (request.history or [])]
+    graph_input: dict = {
+        "query": request.message,
+        "history": history_dicts,
+        "conversation_id": conversation_id,
+        "top_k": request.top_k,
+        "use_retrieval": request.use_retrieval,
+    }
 
-    # ── Prompt ───────────────────────────────────────────────────────────────
-    history: List[HistoryMessage] = request.history or []
-    messages: List[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for m in history:
-        messages.append({"role": m.role, "content": m.content})
-
-    try:
-        if trace:
-            bp_span = trace.span(name="build_prompt", input={"docs_count": len(retrieved)})
-        prompt = build_prompt(request.message, retrieved)
-        messages.append({"role": "user", "content": prompt})
-        if trace:
-            bp_span.end(output={"prompt_length": len(prompt)})
-    except Exception:
-        if trace:
-            try:
-                bp_span.end()
-            except Exception:
-                pass
-        raise
-
-    # ── LLM Generation ───────────────────────────────────────────────────────
-    deployment = get_chat_deployment()
-    client = get_client()
+    # Langfuse: retrieve span
+    r_span = None
+    bp_span = None
     gen_span = None
     try:
         if trace:
-            gen_span = trace.generation(
-                name="llm_generate",
-                model=deployment,
-                input=messages,
-            )
-        completion = client.chat.completions.create(
-            model=deployment,
-            messages=messages,
+            r_span = trace.span(name="retrieve", input={"query": request.message})
+    except Exception:
+        pass
+
+    try:
+        # Step through nodes for Langfuse observability
+        # 1) Retrieve
+        from scripts.rag_graph import retrieve_node, build_prompt_node
+        state = dict(graph_input)
+        retrieve_result = retrieve_node(state)
+        state.update(retrieve_result)
+
+        if r_span:
+            try:
+                r_span.end(output={
+                    "chunks_count": len(state.get("contexts", [])),
+                    "sources": [{"title": d.get("title"), "page": d.get("page")} for d in state.get("contexts", [])],
+                })
+            except Exception:
+                pass
+
+        # 2) Build prompt
+        try:
+            if trace:
+                bp_span = trace.span(name="build_prompt", input={"docs_count": len(state.get("contexts", []))})
+        except Exception:
+            pass
+
+        bp_result = build_prompt_node(state)
+        state.update(bp_result)
+
+        if bp_span:
+            try:
+                messages = state.get("prompt_messages", [])
+                bp_span.end(output={"prompt_length": len(messages[-1]["content"]) if messages else 0})
+            except Exception:
+                pass
+
+        # 3) Generate (via LangChain AzureChatOpenAI)
+        deployment = get_chat_deployment()
+        try:
+            if trace:
+                gen_span = trace.generation(
+                    name="llm_generate",
+                    model=deployment,
+                    input=state.get("prompt_messages", []),
+                )
+        except Exception:
+            pass
+
+        from langchain_openai import AzureChatOpenAI
+        llm = AzureChatOpenAI(
+            azure_deployment=deployment,
+            azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/"),
+            api_key=os.environ.get("AZURE_OPENAI_API_KEY", ""),
+            api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-01"),
+            temperature=0,
         )
-        answer = completion.choices[0].message.content or ""
+        result = llm.invoke(state["prompt_messages"])
+        answer = result.content or ""
+
         if gen_span:
-            usage = getattr(completion, "usage", None)
-            gen_span.end(
-                output=answer,
-                usage={
-                    "input": getattr(usage, "prompt_tokens", 0),
-                    "output": getattr(usage, "completion_tokens", 0),
-                    "unit": "TOKENS",
-                } if usage else None,
-            )
+            try:
+                usage_meta = result.usage_metadata or {}
+                gen_span.end(
+                    output=answer,
+                    usage={
+                        "input": usage_meta.get("input_tokens", 0),
+                        "output": usage_meta.get("output_tokens", 0),
+                        "unit": "TOKENS",
+                    } if usage_meta else None,
+                )
+            except Exception:
+                pass
+
     except Exception as exc:
+        # Close any open spans on error
+        for s in (r_span, bp_span):
+            if s:
+                try:
+                    s.end(output={"error": str(exc)})
+                except Exception:
+                    pass
         if gen_span:
             try:
                 gen_span.end(output={"error": str(exc)})
@@ -447,6 +475,7 @@ def chat_answer(request: ChatRequest):
             except Exception:
                 pass
 
+    retrieved = state.get("contexts", [])
     citations = _build_citations_from_retrieved(retrieved)
     _save_conversation_to_blob(
         conversation_id=conversation_id,
@@ -463,12 +492,10 @@ def chat_answer(request: ChatRequest):
 
 @app.post("/v1/chat/stream")
 def chat_stream(request: ChatRequest):
-    """Day4 流式主接口（SSE）。
+    """流式主接口（SSE）— LangGraph 编排版。
 
-    协议遵循 PRD/ADR：
-    1) `citation_data` 先发（检索完成即可得到）
-    2) `response_text` 持续发（LLM token streaming）
-    3) `done` 结束
+    Day10：retrieve + build_prompt 由 graph node 执行，generate 用 LangChain streaming。
+    协议不变：citation_data → response_text → done。
     """
     conversation_id = create_conversation_if_needed(request.conversation_id)
     lf = _lf()
@@ -483,57 +510,59 @@ def chat_stream(request: ChatRequest):
     except Exception:
         pass
 
-    # ── Retrieval ────────────────────────────────────────────────────────────
-    retrieved: List[dict] = []
-    if request.use_retrieval:
+    # ── LangGraph: retrieve + build_prompt nodes ─────────────────────────────
+    from scripts.rag_graph import retrieve_node, build_prompt_node
+
+    history_dicts = [{"role": m.role, "content": m.content} for m in (request.history or [])]
+    state: dict = {
+        "query": request.message,
+        "history": history_dicts,
+        "conversation_id": conversation_id,
+        "top_k": request.top_k,
+        "use_retrieval": request.use_retrieval,
+    }
+
+    # 1) Retrieve
+    r_span = None
+    try:
+        if trace:
+            r_span = trace.span(name="retrieve", input={"query": request.message})
+    except Exception:
+        pass
+
+    retrieve_result = retrieve_node(state)
+    state.update(retrieve_result)
+    retrieved = state.get("contexts", [])
+
+    if r_span:
         try:
-            if trace:
-                r_span = trace.span(name="retrieve", input={"query": request.message})
-            retrieved = get_search_client().search(request.message, top_k=request.top_k)
-            if trace:
-                r_span.end(output={
-                    "chunks_count": len(retrieved),
-                    "sources": [{"title": d.get("title"), "page": d.get("page")} for d in retrieved],
-                })
-        except Exception as exc:
-            if trace:
-                try:
-                    r_span.end(output={"error": str(exc)})
-                except Exception:
-                    pass
-            raise
+            r_span.end(output={
+                "chunks_count": len(retrieved),
+                "sources": [{"title": d.get("title"), "page": d.get("page")} for d in retrieved],
+            })
+        except Exception:
+            pass
 
-    # ── Prompt ───────────────────────────────────────────────────────────────
-    history: List[HistoryMessage] = request.history or []
-    messages: List[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for m in history:
-        messages.append({"role": m.role, "content": m.content})
-
+    # 2) Build prompt
+    bp_span = None
     try:
         if trace:
             bp_span = trace.span(name="build_prompt", input={"docs_count": len(retrieved)})
-        prompt = build_prompt(request.message, retrieved)
-        messages.append({"role": "user", "content": prompt})
-        if trace:
-            bp_span.end(output={"prompt_length": len(prompt)})
     except Exception:
-        if trace:
-            try:
-                bp_span.end()
-            except Exception:
-                pass
-        raise
+        pass
 
-    # ── LLM streaming — started here, span closed inside generator ───────────
+    bp_result = build_prompt_node(state)
+    state.update(bp_result)
+    messages = state["prompt_messages"]
+
+    if bp_span:
+        try:
+            bp_span.end(output={"prompt_length": len(messages[-1]["content"]) if messages else 0})
+        except Exception:
+            pass
+
+    # 3) Generate — LangChain AzureChatOpenAI streaming
     deployment = get_chat_deployment()
-    client = get_client()
-    # stream_options include_usage：最后一个 chunk 会携带 token 统计
-    stream = client.chat.completions.create(
-        model=deployment,
-        messages=messages,
-        stream=True,
-        stream_options={"include_usage": True},
-    )
     gen_span = None
     try:
         if trace:
@@ -545,37 +574,32 @@ def chat_stream(request: ChatRequest):
     except Exception:
         pass
 
+    from langchain_openai import AzureChatOpenAI
+    llm = AzureChatOpenAI(
+        azure_deployment=deployment,
+        azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/"),
+        api_key=os.environ.get("AZURE_OPENAI_API_KEY", ""),
+        api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-01"),
+        temperature=0,
+        streaming=True,
+    )
+
     def event_generator():
         citations = _build_citations_from_retrieved(retrieved)
         yield _sse_event("citation_data", {"citations": [c.dict() for c in citations]})
 
         full_text = ""
-        usage = None
         try:
-            for chunk in stream:
-                # usage chunk（choices 为空，只含 token 统计）
-                if not chunk.choices:
-                    if getattr(chunk, "usage", None):
-                        usage = chunk.usage
-                    continue
-                delta = chunk.choices[0].delta
-                text = getattr(delta, "content", None) or ""
+            for chunk in llm.stream(messages):
+                text = chunk.content or ""
                 if not text:
                     continue
                 full_text += text
                 yield _sse_event("response_text", {"text": text})
         finally:
-            # span 必须在 generator 内关闭，而非在 chat_stream() 函数体内
             if gen_span:
                 try:
-                    gen_span.end(
-                        output=full_text,
-                        usage={
-                            "input": getattr(usage, "prompt_tokens", 0),
-                            "output": getattr(usage, "completion_tokens", 0),
-                            "unit": "TOKENS",
-                        } if usage else None,
-                    )
+                    gen_span.end(output=full_text)
                 except Exception:
                     pass
             if lf:
@@ -586,7 +610,6 @@ def chat_stream(request: ChatRequest):
 
         yield _sse_event("done", {"conversation_id": conversation_id})
 
-        # Blob 写入在 done event 之后，确保 full_text 已完整收集
         _save_conversation_to_blob(
             conversation_id=conversation_id,
             history=request.history or [],

@@ -36,8 +36,13 @@ def _get_azure_openai_client() -> AzureOpenAI:
 
 
 def get_embedding_deployment() -> str:
-    # PRD 对齐：默认使用 text-embedding-ada-002
-    return os.environ.get("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-ada-002")
+    return os.environ.get("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
+
+
+def get_embedding_dimensions() -> int | None:
+    """Return configured embedding dimensions, or None to use model default."""
+    val = os.environ.get("EMBEDDING_DIMENSIONS", "").strip()
+    return int(val) if val else None
 
 
 def _is_429(e: BaseException) -> bool:
@@ -51,8 +56,13 @@ def _is_429(e: BaseException) -> bool:
     wait=wait_fixed(60),
     stop=stop_after_attempt(3),
 )
-def _embed_one_batch(client: AzureOpenAI, deployment: str, batch: List[str]) -> List[List[float]]:
-    resp = client.embeddings.create(model=deployment, input=batch)
+def _embed_one_batch(
+    client: AzureOpenAI, deployment: str, batch: List[str], dimensions: int | None = None
+) -> List[List[float]]:
+    kwargs: dict = {"model": deployment, "input": batch}
+    if dimensions is not None:
+        kwargs["dimensions"] = dimensions
+    resp = client.embeddings.create(**kwargs)
     return [d.embedding for d in resp.data]
 
 
@@ -60,15 +70,17 @@ def embed_texts_batch(texts: List[str]) -> List[List[float]]:
     """批量调用 Embedding API。
 
     对齐 PRD：batch size=20（配合 chunk 大小控制请求体规模）。
+    支持 text-embedding-3-large 的 dimensions 参数（通过 EMBEDDING_DIMENSIONS 环境变量）。
     """
     if not texts:
         return []
     client = _get_azure_openai_client()
     deployment = get_embedding_deployment()
+    dimensions = get_embedding_dimensions()
     all_embeddings: List[List[float]] = []
     for i in range(0, len(texts), EMBED_BATCH_SIZE):
         batch = texts[i : i + EMBED_BATCH_SIZE]
-        all_embeddings.extend(_embed_one_batch(client, deployment, batch))
+        all_embeddings.extend(_embed_one_batch(client, deployment, batch, dimensions))
         if i + EMBED_BATCH_SIZE < len(texts):
             time.sleep(EMBED_BATCH_SLEEP_SEC)
     return all_embeddings
@@ -111,7 +123,11 @@ def retrieve_from_chroma(query: str, top_k: int = 5) -> List[dict]:
         return []
     client = _get_azure_openai_client()
     deployment = get_embedding_deployment()
-    q_emb = client.embeddings.create(model=deployment, input=[query])
+    dimensions = get_embedding_dimensions()
+    kwargs: dict = {"model": deployment, "input": [query]}
+    if dimensions is not None:
+        kwargs["dimensions"] = dimensions
+    q_emb = client.embeddings.create(**kwargs)
     query_embedding = q_emb.data[0].embedding
     coll = get_chroma_collection()
     results = coll.query(query_embeddings=[query_embedding], n_results=top_k, include=["documents", "metadatas"])

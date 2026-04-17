@@ -301,3 +301,139 @@ curl -s -X POST http://localhost:8000/v1/feedback \
 - **前端请求还是打到 localhost** → 检查 `frontend/.env.production` 里 `VITE_API_BASE` 是否填了生产 URL，且 build 时用的是 production 模式
 - **Container App 启动失败** → Azure Portal → Container App → Log stream 查看启动报错；最常见原因：环境变量缺失
 - **Blob 容器不存在报错** → 代码会自动创建容器，但需要 Connection String 有写权限（用 Account Key 的 Connection String 即可）
+
+---
+
+## Day 10 — LangChain + LangGraph 编排 + LLM/Embedding 升级
+
+### 需要配置
+
+#### A. 升级 LLM 和 Embedding 模型
+
+1. 在 Azure Portal → Azure OpenAI → 确保已部署以下模型：
+   - **gpt-4o**（如果之前只有 gpt-4o-mini，需要新建 deployment）
+   - **text-embedding-3-large**（如果之前只有 text-embedding-ada-002，需要新建 deployment）
+
+2. 修改 `.env` 中的模型配置：
+
+```
+AZURE_OPENAI_CHAT_DEPLOYMENT=gpt-4o
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-3-large
+# 可选：设置 embedding 维度缩减（默认 3072，可设为 1024 或 512 以节省存储）
+# EMBEDDING_DIMENSIONS=3072
+```
+
+#### B. 重建索引（Embedding 维度变了，旧索引不兼容）
+
+**重要：** 因为 text-embedding-3-large 的向量维度（3072）与 ada-002（1536）不同，必须重新 ingest 所有文档。
+
+如果用 Azure AI Search：
+- 在 Azure Portal → Azure AI Search → 删除旧的 `hr-documents` 索引
+- 代码会在 ingest 时自动用新维度重建索引
+
+如果用本地 ChromaDB：
+- 删除 `chroma_db/` 目录下所有文件，让代码重建 collection
+
+#### C. 重新构建镜像并 ingest
+
+```powershell
+# Day 10 新增了 langchain/langgraph 依赖，必须重新 build
+docker compose build backend
+docker compose up -d
+
+# 重新入库（用新的 embedding 模型）
+docker exec rag-backend python scripts/prepdocs.py --input-dir data --pattern "test*.pdf" --parser local
+```
+
+---
+
+### E2E 测试
+
+**测试 1：非流式接口基本功能（LangGraph 链路验证）**
+
+```powershell
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/answer" -ContentType "application/json" -Body '{"message":"What dental benefits are covered?","history":[]}'
+```
+
+预期：
+- [ ] 正常返回回答，包含引用（来源：xxx.pdf，第 X 页）
+- [ ] 回答质量不低于 Day 9（GPT-4o 预期更好）
+
+**测试 2：流式接口 SSE 顺序回归**
+
+```powershell
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/stream" -ContentType "application/json" -Body '{"message":"What is the vision coverage?","history":[]}'
+```
+
+预期：
+- [ ] SSE 事件顺序不变：`citation_data` → `response_text` → `done`
+- [ ] citation 内容正常（文件名 + 页码 + snippet）
+
+**测试 3：幻觉压制回归**
+
+```powershell
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/answer" -ContentType "application/json" -Body '{"message":"Does the company provide shuttle bus service?","history":[]}'
+```
+
+预期：
+- [ ] 回答包含"根据现有资料无法确认"，不编造答案
+
+**测试 4：Langfuse Trace 验证 LangGraph 节点**
+
+发送请求后，打开 Langfuse Dashboard → Traces：
+
+- [ ] 出现 `rag-chat-answer` 或 `rag-chat-stream` Trace
+- [ ] 点开后下挂 3 个 Span：`retrieve` / `build_prompt` / `llm_generate`
+- [ ] `llm_generate` Span 的 model 显示为 `gpt-4o`（不是 gpt-4o-mini）
+
+**测试 5：确认 LLM 使用 GPT-4o**
+
+查看后端日志或 Langfuse trace，确认 model name：
+
+```powershell
+docker compose logs backend --tail 30
+```
+
+- [ ] 日志或 Langfuse 中 model 为 gpt-4o
+
+**测试 6：确认 Embedding 使用 text-embedding-3-large**
+
+在 ingest 日志中确认：
+
+```powershell
+docker exec rag-backend python -c "from scripts.chroma_embed import get_embedding_deployment; print(get_embedding_deployment())"
+```
+
+- [ ] 输出 `text-embedding-3-large`
+
+**测试 7：RAGAS 评估跑通**
+
+```powershell
+docker exec rag-backend python scripts/evaluate.py --dataset data/eval_dataset.json --top-k 5
+```
+
+- [ ] 三个维度分数正常（0~1 之间，不是 NaN）
+- [ ] 与 Day 8 基线对比，Faithfulness 和 Answer Relevancy 预期因 GPT-4o 有所提升
+
+**测试 8：已有功能回归**
+
+- [ ] 打开 http://localhost:3000 → 前端正常加载
+- [ ] 发消息 → 正常回答
+- [ ] 👎 按钮正常工作
+- [ ] feedback 接口正常：
+
+```powershell
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/feedback" -ContentType "application/json" -Body '{"conversation_id":"test-123","message_index":1}'
+```
+
+预期：返回 `{"ok": true}`
+
+---
+
+### 常见问题
+
+- **`No module named 'langgraph'`** → 镜像没有新依赖，运行 `docker compose build backend` 再 `docker compose up -d`
+- **检索返回空或报错** → 确认已用 text-embedding-3-large 重新 ingest；旧索引向量维度不兼容
+- **Azure AI Search 报维度不匹配** → 需要在 Azure Portal 删除旧索引后重新 ingest
+- **GPT-4o deployment 不存在** → 检查 Azure Portal 是否已部署 gpt-4o，确认 `.env` 中 `AZURE_OPENAI_CHAT_DEPLOYMENT` 名称正确
+- **SSE 输出为空** → 检查 LangChain streaming 的 `chunk.content` 提取，确认 `AzureChatOpenAI` 的 `streaming=True` 已设置

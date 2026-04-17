@@ -46,14 +46,20 @@ from azure.search.documents.indexes.models import (
 )
 from azure.search.documents.models import VectorizedQuery
 
-from scripts.chroma_embed import embed_texts_batch
+from scripts.chroma_embed import embed_texts_batch, get_embedding_dimensions
 from scripts.search_client import SearchClient, _make_snippet
 
 logger = logging.getLogger(__name__)
 
 _HYBRID_RECALL = 20   # Hybrid 阶段召回数量
 _SEMANTIC_TOP = 5     # Semantic Ranker 精排后保留数量
-_VECTOR_DIMS = 1536   # text-embedding-ada-002 / text-embedding-3-small 维度
+# text-embedding-3-large 默认 3072 维；若设置了 EMBEDDING_DIMENSIONS 则使用该值
+_DEFAULT_VECTOR_DIMS = 3072
+
+
+def _get_vector_dims() -> int:
+    dims = get_embedding_dimensions()
+    return dims if dims is not None else _DEFAULT_VECTOR_DIMS
 
 
 def _get_env(name: str) -> str:
@@ -89,7 +95,7 @@ def _make_index(name: str, semantic_config: str) -> SearchIndex:
                 name="content_vector",
                 type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
                 searchable=True,
-                vector_search_dimensions=_VECTOR_DIMS,
+                vector_search_dimensions=_get_vector_dims(),
                 vector_search_profile_name="hr-vector-profile",
             ),
             SimpleField(name="source_filename", type=SearchFieldDataType.String, filterable=True, facetable=True),
