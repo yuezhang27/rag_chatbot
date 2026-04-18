@@ -66,30 +66,6 @@ def _save_conversation_to_blob(
     except Exception as exc:
         logger.error("Blob write failed: conversation_id=%s error=%s", conversation_id, exc)
 
-# ---------------------------------------------------------------------------
-# Langfuse — optional, gracefully skipped if env vars not set
-# ---------------------------------------------------------------------------
-_langfuse = None
-
-def _init_langfuse():
-    global _langfuse
-    pk = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
-    sk = os.environ.get("LANGFUSE_SECRET_KEY", "")
-    host = os.environ.get("LANGFUSE_HOST", "https://cloud.langfuse.com")
-    if not pk or not sk:
-        logger.info("Langfuse env vars not set — tracing disabled")
-        return
-    try:
-        from langfuse import Langfuse
-        _langfuse = Langfuse(public_key=pk, secret_key=sk, host=host)
-        logger.info("Langfuse initialised (host=%s)", host)
-    except Exception as exc:
-        logger.warning("Langfuse init failed, tracing disabled: %s", exc)
-
-def _lf():
-    """Return the Langfuse client, or None if not configured."""
-    return _langfuse
-
 
 DATABASE_PATH = "chatbot.db"
 
@@ -186,7 +162,6 @@ app = FastAPI()
 @app.on_event("startup")
 def startup_event() -> None:
     init_db()
-    _init_langfuse()
     # Azure Application Insights — optional, auto-instruments FastAPI HTTP layer
     ai_conn = os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING", "")
     if ai_conn:
@@ -345,19 +320,12 @@ THIS IS USED TO TEST LLM WORKS. PLEASE GO TO http://localhost:8000/v1/chat/test
 
 @app.post("/v1/chat/answer", response_model=ChatResponse)
 def chat_answer(request: ChatRequest):
-    """非流式回答（LangGraph 编排版 + Day 12 语义缓存 + Day 13 Guardrails）。"""
+    """非流式回答（LangGraph 编排版 + Day 12 语义缓存 + Day 13 Guardrails）。
+
+    Day 15: Langfuse 手动埋点已移除。LangSmith 通过 env vars 自动捕获
+    LangChain/LangGraph 调用，无需代码。
+    """
     conversation_id = create_conversation_if_needed(request.conversation_id)
-    lf = _lf()
-    trace = None
-    try:
-        if lf:
-            trace = lf.trace(
-                name="rag-chat-answer",
-                input={"message": request.message},
-                metadata={"conversation_id": conversation_id},
-            )
-    except Exception:
-        pass
 
     from scripts.rag_graph import (
         cache_check_node, retrieve_node, build_prompt_node, cache_write_node,
@@ -374,29 +342,9 @@ def chat_answer(request: ChatRequest):
     }
 
     # ── 0) Cache check ───────────────────────────────────────────────────────
-    cache_span = None
-    try:
-        if trace:
-            cache_span = trace.span(name="cache_check", input={"query": request.message})
-    except Exception:
-        pass
-
     cache_result = cache_check_node(state)
     state.update(cache_result)
     cache_hit = state.get("cache_hit", False)
-
-    if cache_span:
-        try:
-            cache_span.end(output={"cache_hit": cache_hit})
-        except Exception:
-            pass
-
-    # Update trace metadata with cache status
-    if trace:
-        try:
-            trace.update(metadata={"conversation_id": conversation_id, "cache_hit": cache_hit})
-        except Exception:
-            pass
 
     if cache_hit:
         # ── Cache HIT: return cached response directly ────────────────────────
@@ -410,11 +358,6 @@ def chat_answer(request: ChatRequest):
             )
             for c in cached_citations
         ]
-        if lf:
-            try:
-                lf.flush()
-            except Exception:
-                pass
         _save_conversation_to_blob(
             conversation_id=conversation_id,
             history=request.history or [],
@@ -425,155 +368,44 @@ def chat_answer(request: ChatRequest):
 
     # ── Day 13: Guardrails (after cache miss) ─────────────────────────────────
     # Layer 1: Azure Content Safety
-    cs_span = None
-    try:
-        if trace:
-            cs_span = trace.span(name="content_safety_check", input={"query": request.message})
-    except Exception:
-        pass
-
     cs_result = content_safety_check_node(state)
     state.update(cs_result)
 
-    if cs_span:
-        try:
-            cs_span.end(output={"guardrail_denied": state.get("guardrail_denied", False)})
-        except Exception:
-            pass
-
     if state.get("guardrail_denied", False):
         denial = state.get("denial_message", "抱歉，您的请求无法处理。")
-        if lf:
-            try:
-                lf.flush()
-            except Exception:
-                pass
         return ChatResponse(conversation_id=conversation_id, answer=denial, citations=[])
 
     # Layer 2: NeMo Guardrails
-    nemo_span = None
-    try:
-        if trace:
-            nemo_span = trace.span(name="nemo_guardrails_check", input={"query": request.message})
-    except Exception:
-        pass
-
     nemo_result = nemo_guardrails_check_node(state)
     state.update(nemo_result)
 
-    if nemo_span:
-        try:
-            nemo_span.end(output={"guardrail_denied": state.get("guardrail_denied", False)})
-        except Exception:
-            pass
-
     if state.get("guardrail_denied", False):
         denial = state.get("denial_message", "这个问题超出了 HR 政策和合规范围，建议您联系相关部门获取帮助。")
-        if lf:
-            try:
-                lf.flush()
-            except Exception:
-                pass
         return ChatResponse(conversation_id=conversation_id, answer=denial, citations=[])
 
     # ── Cache MISS + Guardrails PASS: full RAG pipeline ───────────────────────
-    r_span = None
-    bp_span = None
-    gen_span = None
-    try:
-        if trace:
-            r_span = trace.span(name="retrieve", input={"query": request.message})
-    except Exception:
-        pass
+    retrieve_result = retrieve_node(state)
+    state.update(retrieve_result)
 
-    try:
-        retrieve_result = retrieve_node(state)
-        state.update(retrieve_result)
+    bp_result = build_prompt_node(state)
+    state.update(bp_result)
 
-        if r_span:
-            try:
-                r_span.end(output={
-                    "chunks_count": len(state.get("contexts", [])),
-                    "sources": [{"title": d.get("title"), "page": d.get("page")} for d in state.get("contexts", [])],
-                })
-            except Exception:
-                pass
+    deployment = get_chat_deployment()
 
-        try:
-            if trace:
-                bp_span = trace.span(name="build_prompt", input={"docs_count": len(state.get("contexts", []))})
-        except Exception:
-            pass
+    from langchain_openai import AzureChatOpenAI
+    llm = AzureChatOpenAI(
+        azure_deployment=deployment,
+        azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/"),
+        api_key=os.environ.get("AZURE_OPENAI_API_KEY", ""),
+        api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-01"),
+        temperature=0,
+    )
+    result = llm.invoke(state["prompt_messages"])
+    answer = result.content or ""
+    state["response"] = answer
 
-        bp_result = build_prompt_node(state)
-        state.update(bp_result)
-
-        if bp_span:
-            try:
-                messages = state.get("prompt_messages", [])
-                bp_span.end(output={"prompt_length": len(messages[-1]["content"]) if messages else 0})
-            except Exception:
-                pass
-
-        deployment = get_chat_deployment()
-        try:
-            if trace:
-                gen_span = trace.generation(
-                    name="llm_generate",
-                    model=deployment,
-                    input=state.get("prompt_messages", []),
-                )
-        except Exception:
-            pass
-
-        from langchain_openai import AzureChatOpenAI
-        llm = AzureChatOpenAI(
-            azure_deployment=deployment,
-            azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/"),
-            api_key=os.environ.get("AZURE_OPENAI_API_KEY", ""),
-            api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-01"),
-            temperature=0,
-        )
-        result = llm.invoke(state["prompt_messages"])
-        answer = result.content or ""
-        state["response"] = answer
-
-        if gen_span:
-            try:
-                usage_meta = result.usage_metadata or {}
-                gen_span.end(
-                    output=answer,
-                    usage={
-                        "input": usage_meta.get("input_tokens", 0),
-                        "output": usage_meta.get("output_tokens", 0),
-                        "unit": "TOKENS",
-                    } if usage_meta else None,
-                )
-            except Exception:
-                pass
-
-        # Cache write
-        cache_write_node(state)
-
-    except Exception as exc:
-        for s in (r_span, bp_span):
-            if s:
-                try:
-                    s.end(output={"error": str(exc)})
-                except Exception:
-                    pass
-        if gen_span:
-            try:
-                gen_span.end(output={"error": str(exc)})
-            except Exception:
-                pass
-        raise
-    finally:
-        if lf:
-            try:
-                lf.flush()
-            except Exception:
-                pass
+    # Cache write
+    cache_write_node(state)
 
     retrieved = state.get("contexts", [])
     citations = _build_citations_from_retrieved(retrieved)
@@ -593,19 +425,11 @@ def chat_stream(request: ChatRequest):
     协议不变：citation_data → response_text → done。
     缓存命中时 response_text 一次性发完（非逐字流式）。
     被拒绝时 SSE 返回空 citations + 拒答提示。
+
+    Day 15: Langfuse 手动埋点已移除。LangSmith 通过 env vars 自动捕获
+    LangChain/LangGraph 调用，无需代码。
     """
     conversation_id = create_conversation_if_needed(request.conversation_id)
-    lf = _lf()
-    trace = None
-    try:
-        if lf:
-            trace = lf.trace(
-                name="rag-chat-stream",
-                input={"message": request.message},
-                metadata={"conversation_id": conversation_id},
-            )
-    except Exception:
-        pass
 
     from scripts.rag_graph import (
         cache_check_node, retrieve_node, build_prompt_node, cache_write_node,
@@ -622,28 +446,9 @@ def chat_stream(request: ChatRequest):
     }
 
     # ── 0) Cache check ───────────────────────────────────────────────────────
-    cache_span = None
-    try:
-        if trace:
-            cache_span = trace.span(name="cache_check", input={"query": request.message})
-    except Exception:
-        pass
-
     cache_result = cache_check_node(state)
     state.update(cache_result)
     cache_hit = state.get("cache_hit", False)
-
-    if cache_span:
-        try:
-            cache_span.end(output={"cache_hit": cache_hit})
-        except Exception:
-            pass
-
-    if trace:
-        try:
-            trace.update(metadata={"conversation_id": conversation_id, "cache_hit": cache_hit})
-        except Exception:
-            pass
 
     if cache_hit:
         # ── Cache HIT: send cached response as SSE ────────────────────────────
@@ -663,12 +468,6 @@ def chat_stream(request: ChatRequest):
             yield _sse_event("response_text", {"text": cached_answer})
             yield _sse_event("done", {"conversation_id": conversation_id})
 
-            if lf:
-                try:
-                    lf.flush()
-                except Exception:
-                    pass
-
             _save_conversation_to_blob(
                 conversation_id=conversation_id,
                 history=request.history or [],
@@ -680,21 +479,8 @@ def chat_stream(request: ChatRequest):
 
     # ── Day 13: Guardrails (after cache miss) ─────────────────────────────────
     # Layer 1: Azure Content Safety
-    cs_span = None
-    try:
-        if trace:
-            cs_span = trace.span(name="content_safety_check", input={"query": request.message})
-    except Exception:
-        pass
-
     cs_result = content_safety_check_node(state)
     state.update(cs_result)
-
-    if cs_span:
-        try:
-            cs_span.end(output={"guardrail_denied": state.get("guardrail_denied", False)})
-        except Exception:
-            pass
 
     if state.get("guardrail_denied", False):
         denial = state.get("denial_message", "抱歉，您的请求无法处理。")
@@ -703,30 +489,12 @@ def chat_stream(request: ChatRequest):
             yield _sse_event("citation_data", {"citations": []})
             yield _sse_event("response_text", {"text": denial})
             yield _sse_event("done", {"conversation_id": conversation_id})
-            if lf:
-                try:
-                    lf.flush()
-                except Exception:
-                    pass
 
         return StreamingResponse(denied_cs_generator(), media_type="text/event-stream")
 
     # Layer 2: NeMo Guardrails
-    nemo_span = None
-    try:
-        if trace:
-            nemo_span = trace.span(name="nemo_guardrails_check", input={"query": request.message})
-    except Exception:
-        pass
-
     nemo_result = nemo_guardrails_check_node(state)
     state.update(nemo_result)
-
-    if nemo_span:
-        try:
-            nemo_span.end(output={"guardrail_denied": state.get("guardrail_denied", False)})
-        except Exception:
-            pass
 
     if state.get("guardrail_denied", False):
         denial = state.get("denial_message", "这个问题超出了 HR 政策和合规范围，建议您联系相关部门获取帮助。")
@@ -735,66 +503,22 @@ def chat_stream(request: ChatRequest):
             yield _sse_event("citation_data", {"citations": []})
             yield _sse_event("response_text", {"text": denial})
             yield _sse_event("done", {"conversation_id": conversation_id})
-            if lf:
-                try:
-                    lf.flush()
-                except Exception:
-                    pass
 
         return StreamingResponse(denied_nemo_generator(), media_type="text/event-stream")
 
     # ── Cache MISS + Guardrails PASS: full RAG pipeline ───────────────────────
     # 1) Retrieve
-    r_span = None
-    try:
-        if trace:
-            r_span = trace.span(name="retrieve", input={"query": request.message})
-    except Exception:
-        pass
-
     retrieve_result = retrieve_node(state)
     state.update(retrieve_result)
     retrieved = state.get("contexts", [])
 
-    if r_span:
-        try:
-            r_span.end(output={
-                "chunks_count": len(retrieved),
-                "sources": [{"title": d.get("title"), "page": d.get("page")} for d in retrieved],
-            })
-        except Exception:
-            pass
-
     # 2) Build prompt
-    bp_span = None
-    try:
-        if trace:
-            bp_span = trace.span(name="build_prompt", input={"docs_count": len(retrieved)})
-    except Exception:
-        pass
-
     bp_result = build_prompt_node(state)
     state.update(bp_result)
     messages = state["prompt_messages"]
 
-    if bp_span:
-        try:
-            bp_span.end(output={"prompt_length": len(messages[-1]["content"]) if messages else 0})
-        except Exception:
-            pass
-
     # 3) Generate — LangChain AzureChatOpenAI streaming
     deployment = get_chat_deployment()
-    gen_span = None
-    try:
-        if trace:
-            gen_span = trace.generation(
-                name="llm_generate",
-                model=deployment,
-                input=messages,
-            )
-    except Exception:
-        pass
 
     from langchain_openai import AzureChatOpenAI
     llm = AzureChatOpenAI(
@@ -811,24 +535,12 @@ def chat_stream(request: ChatRequest):
         yield _sse_event("citation_data", {"citations": [c.dict() for c in citations]})
 
         full_text = ""
-        try:
-            for chunk in llm.stream(messages):
-                text = chunk.content or ""
-                if not text:
-                    continue
-                full_text += text
-                yield _sse_event("response_text", {"text": text})
-        finally:
-            if gen_span:
-                try:
-                    gen_span.end(output=full_text)
-                except Exception:
-                    pass
-            if lf:
-                try:
-                    lf.flush()
-                except Exception:
-                    pass
+        for chunk in llm.stream(messages):
+            text = chunk.content or ""
+            if not text:
+                continue
+            full_text += text
+            yield _sse_event("response_text", {"text": text})
 
         yield _sse_event("done", {"conversation_id": conversation_id})
 
