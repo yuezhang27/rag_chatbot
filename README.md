@@ -1,5 +1,9 @@
 ## 超小 RAG Chatbot MVP
 
+### 为什么用 Streamlit 而不是 React
+
+Chatbot UI 本质就是一个输入框 + 消息列表，页面简单到不需要前端框架。Streamlit 内置的 `st.chat_input` + `st.chat_message` 直接覆盖全部需求，纯 Python 几行代码就能出 demo。对于 AI Engineer 岗位，Streamlit 是标配原型工具，用 React 写这种页面属于 over-engineering。
+
 ### E2E
 
 #### 准备资料
@@ -21,8 +25,7 @@ docker exec rag-backend python scripts/check_chroma.py
 
 #### E2E
 
-- http://localhost:3000/
-- http://localhost:3000/ask
+- http://localhost:8501 （Streamlit 前端，侧边栏切换 Chat / Ask）
 
 #### 关闭
 

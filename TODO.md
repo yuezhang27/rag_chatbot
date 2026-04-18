@@ -914,3 +914,156 @@ Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/feedback" -Content
 - **被拒但仍返回 RAG 回答** → 检查 `app.py` 中 `guardrail_denied` 判断是否在 retrieve 之前
 - **`No module named 'nemoguardrails'`** → 运行 `docker compose build backend` 重新构建镜像
 - **`No module named 'azure.ai.contentsafety'`** → 同上，重新 build
+
+---
+
+## Day 14 — 前端迁移 React → Streamlit
+
+### 需要配置
+
+#### A. 重新构建镜像
+
+```powershell
+# Day 14 新增了 streamlit 依赖，需要重新 build
+docker compose build
+docker compose up -d
+```
+
+> **注意**：`frontend` 容器已移除，React 代码已删除。Streamlit 服务在 `http://localhost:8501` 访问。
+
+#### B. 环境变量（可选）
+
+Streamlit 容器内 `API_BASE_URL` 已在 `docker-compose.yml` 中设置为 `http://backend:8000`，无需额外配置。
+
+如果本地直接运行（不通过 Docker），需设置：
+
+```
+API_BASE_URL=http://localhost:8000
+```
+
+然后运行：
+
+```powershell
+streamlit run streamlit_app.py --server.port 8501
+```
+
+---
+
+### E2E 测试
+
+**测试 1：Streamlit 界面加载**
+
+- 浏览器打开 `http://localhost:8501`
+- [ ] 看到 Chat 界面，侧边栏有 Chat / Ask 切换
+- [ ] 页面无报错
+
+**测试 2：Chat 多轮对话（流式输出）**
+
+- 在 Chat 页面输入 "What dental benefits are covered?" 并发送
+- [ ] LLM 回答逐字出现（流式渲染，非一次性出完）
+- [ ] 回答下方有 "📄 引用来源" 可展开
+- [ ] 展开后显示文件名 + 页码 + 片段
+- 再输入 "Can you tell me more about vision coverage?" 并发送
+- [ ] 回答正常，上一轮对话仍可见（多轮上下文保持）
+
+**测试 3：Ask 单轮问答**
+
+- 侧边栏切换到 Ask 模式
+- 输入 "What is the vision coverage?" 并发送
+- [ ] 正常回答，有引用
+- 再输入 "What dental benefits are covered?"
+- [ ] 上一轮问答被清空，只显示新的问答
+
+**测试 4：Thumbs Down 反馈**
+
+- 在任一模式发一条消息，等回答出现
+- 回答下方应有 👎 按钮
+- 点击 👎 按钮
+- [ ] 按钮变为 "👎 已反馈"（disabled 状态）
+- [ ] 后端日志出现 `thumbs_down conversation_id=xxx message_index=...`
+
+验证后端日志：
+
+```powershell
+docker compose logs backend --tail 20
+```
+
+**测试 5：Citation 面板**
+
+- 发一条有引用的问题（如 "What dental benefits are covered?"）
+- [ ] 回答下方出现 "📄 引用来源 (N)" expander
+- [ ] 展开后列出每条引用：文件名 + 页码 + 片段文本
+
+**测试 6：后端接口回归**
+
+```powershell
+# 非流式接口仍然正常
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/answer" -ContentType "application/json" -Body '{"message":"What dental benefits are covered?","history":[]}'
+
+# 流式接口仍然正常
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/stream" -ContentType "application/json" -Body '{"message":"What is the vision coverage?","history":[]}'
+
+# feedback 接口正常
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/feedback" -ContentType "application/json" -Body '{"conversation_id":"test-123","message_index":1}'
+```
+
+预期：
+- [ ] 非流式接口正常返回，包含 citations
+- [ ] 流式 SSE 顺序不变：`citation_data` → `response_text` → `done`
+- [ ] feedback 接口返回 `{"ok": true}`
+
+**测试 7：React 代码已完全移除**
+
+```powershell
+# 确认 frontend 目录不存在
+ls frontend 2>&1
+```
+
+- [ ] 报错"No such file or directory"
+- [ ] `docker compose ps` 中无 `rag-frontend` 容器
+
+**测试 8：docker-compose up 一键启动**
+
+```powershell
+docker compose down
+docker compose up -d
+docker compose ps
+```
+
+- [ ] 三个服务运行中：`rag-backend`、`rag-redis`、`rag-streamlit`
+- [ ] 无 `rag-frontend` 容器
+- [ ] `http://localhost:8501` 可访问
+- [ ] `http://localhost:8000` 后端可访问
+
+**测试 9：页面刷新行为**
+
+- 在 Chat 模式发几条消息
+- 刷新页面（F5）
+- [ ] 对话历史清空（与原 React 行为一致）
+
+**测试 10：后端不可用时的错误提示**
+
+```powershell
+# 停掉后端
+docker compose stop backend
+
+# 在 Streamlit 页面发消息
+# 预期：页面显示 "无法连接到后端服务，请稍后重试" 错误提示
+
+# 恢复后端
+docker compose start backend
+```
+
+- [ ] 后端停止时显示友好错误提示，不白屏
+- [ ] 后端恢复后功能正常
+
+---
+
+### 常见问题
+
+- **Streamlit 页面白屏** → 检查容器日志 `docker compose logs streamlit --tail 30`；最常见原因：`streamlit` 未安装（需 `docker compose build`）
+- **无法连接后端** → 检查 `API_BASE_URL` 是否正确（Docker 内用 `http://backend:8000`，不是 `localhost`）
+- **回答一次性出完（无流式效果）** → 确认 `st.write_stream` 正确接收 generator；检查 SSE 解析是否正确
+- **Citation 不显示** → 检查 SSE `citation_data` event 是否在 `response_text` 之前到达
+- **页面刷新后白屏** → 检查 `st.session_state` 初始化是否在页面顶部
+- **React 容器仍在运行** → 运行 `docker compose down` 清除旧容器，再 `docker compose up -d`
