@@ -1224,3 +1224,128 @@ Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/answer" -Cont
 - **大量 429 错误** → Azure OpenAI 限流，这是预期行为；报告会记录限流开始的并发级别
 - **Locust 本地 CPU 满载** → 500 并发可能需要分布式 Locust workers
 - **CSV 文件未生成** → 检查 `reports/` 目录是否存在；确认 `--csv` 路径正确
+
+---
+
+## Day 17 — Embedding 选型量化工程 + 中英双语评估
+
+### 需要配置
+
+#### A. Azure OpenAI Embedding 模型部署
+
+实验需要对比三个 embedding 模型，需要在 Azure Portal 确认以下 deployment 存在：
+
+1. `text-embedding-3-large`（Day 10 已部署，无需额外操作）
+2. `text-embedding-ada-002`（如果已下线可跳过，脚本会自动跳过报错模型）
+3. `text-embedding-3-small`（需新建 deployment，如不需要对比可跳过）
+
+> 如果某个模型未部署，用 `--models` 参数指定要测试的模型即可，例如 `--models 3-large`。
+
+#### B. 安装依赖
+
+无新增生产依赖。实验脚本在本地（或 Docker 内）直接运行，所需的 `chromadb`、`openai` 等已在 `requirements.txt` 中。
+
+#### C. 准备测试数据
+
+1. **eval_dataset.json**：复用已有的 `data/eval_dataset.json`。注意 `ground_truth` 字段不能是 `TODO`，必须填写真实答案，否则 Recall@10 计算无意义。
+
+2. **bilingual_eval.json**：已创建 `data/bilingual_eval.json`（10 对中英文问题）。如需跳过双语实验，脚本会自动跳过。
+
+#### D. 确保 PDF 文件存在
+
+脚本需要从 `data/` 目录读取 PDF 并分块。确认 `data/` 下有测试 PDF：
+
+```powershell
+ls data/*.pdf
+```
+
+---
+
+### E2E 测试
+
+**测试 1：单模型快速验证（确认脚本跑通）**
+
+```powershell
+# 只用 3-large 一个模型 + 一个维度，快速验证流程
+python scripts/embedding_benchmark.py --models 3-large --dimensions 3072
+```
+
+预期：
+- [ ] 脚本无异常退出
+- [ ] `reports/` 下生成 `embedding_benchmark_{timestamp}.md` 和 `embedding_raw_results_{timestamp}.json`
+- [ ] 报告包含 Experiment 1（模型对比，只有 3-large 一行）
+- [ ] 报告包含 Experiment 2（维度实验，只有 3072 一行）
+- [ ] 报告包含 Experiment 3（双语检索）
+
+**测试 2：完整三模型对比（需要三个 deployment 都存在）**
+
+```powershell
+python scripts/embedding_benchmark.py --models ada-002,3-small,3-large
+```
+
+预期：
+- [ ] 三个模型都有 Recall@10 结果
+- [ ] 预期排序：3-large > ada-002 ≥ 3-small（或相近）
+- [ ] 不存在的 deployment 会报 warning 并跳过，不影响其他模型
+
+**测试 3：Dimension Reduction 实验**
+
+```powershell
+python scripts/embedding_benchmark.py --models 3-large --dimensions 3072,1024,512
+```
+
+预期：
+- [ ] 报告包含三行维度对比表
+- [ ] 存储大小正确：3072→12,288 bytes、1024→4,096 bytes、512→2,048 bytes
+- [ ] Recall@10 随维度降低而略降（或持平）
+- [ ] 报告包含推荐维度和理由
+
+**测试 4：双语检索验证**
+
+打开报告，查看 Experiment 3 部分：
+
+- [ ] 至少 5 对中英文问题有结果
+- [ ] 每对显示 EN/ZH 检索重叠度（overlap ratio）
+- [ ] 有总结性结论（cross-language retrieval 可行性）
+
+**测试 5：报告内容完整性**
+
+打开 `reports/embedding_benchmark_{timestamp}.md`：
+
+- [ ] 包含 Experiment 1：三模型 Recall@10 对比表
+- [ ] 包含 Experiment 2：维度 vs Recall@10 vs 存储大小 trade-off 表
+- [ ] 包含 Experiment 3：中英双语检索对比
+- [ ] 包含 Overall Recommendation（推荐模型 + 推荐维度 + 双语结论）
+
+**测试 6：原始数据文件验证**
+
+```powershell
+# 检查 JSON 格式正确
+python -c "import json; data=json.load(open('reports/embedding_raw_results_TIMESTAMP.json')); print(list(data.keys()))"
+```
+
+预期：
+- [ ] 包含 keys：`timestamp`、`experiment_1_model_comparison`、`experiment_2_dimension_reduction`、`experiment_3_bilingual`
+- [ ] 每个 experiment 下有 per_question 详细数据
+
+**测试 7：已有功能回归（实验不修改任何已有代码和索引）**
+
+```powershell
+# 确认生产 collection 未被修改
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/answer" -ContentType "application/json" -Body '{"message":"What dental benefits are covered?","history":[]}'
+```
+
+预期：
+- [ ] 回答正常返回
+- [ ] Streamlit http://localhost:8501 正常加载
+- [ ] 生产 ChromaDB collection `documents` 未受影响
+
+---
+
+### 常见问题
+
+- **所有模型 Recall@10 都很低 (< 0.3)** → 检查 `eval_dataset.json` 的 `ground_truth` 是否为真实答案（不能是 `TODO`）
+- **某个模型报错** → 该 deployment 未在 Azure Portal 创建；用 `--models` 参数跳过
+- **Dimension reduction 后 Recall 不降反升** → 小数据集上的正常波动；确认 `dimensions` 参数真正传入了 API
+- **双语实验跳过** → `data/bilingual_eval.json` 文件不存在或为空
+- **临时 collection 残留** → 脚本会自动清理；如有残留可手动删除 `chroma_db/` 中以 `benchmark_` 开头的 collection
