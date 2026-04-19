@@ -1125,3 +1125,102 @@ Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/feedback" -Content
 - **LangSmith 有 trace 但缺少节点** → 只有 LangChain/LangGraph 组件的调用会被自动捕获；纯 Python 函数（如 cache_check）不会自动出现
 - **Cost 数据为 0** → 确认 LangSmith 已正确识别模型定价（Azure OpenAI 模型可能需要在 LangSmith 中确认定价映射）
 - **Application Insights 不工作** → 与 Day 15 变更无关，检查 `APPLICATIONINSIGHTS_CONNECTION_STRING` 是否正确
+
+---
+
+## Day 16 — Locust 性能压测
+
+### 需要配置
+
+#### A. 安装压测依赖（本地机器，非 Docker）
+
+```powershell
+pip install -r requirements-test.txt
+```
+
+> 压测脚本在本地运行（不在 Docker 内），直接打后端 API。
+
+#### B. 设置压测目标
+
+压测目标可通过 `--host` 参数或 `TARGET_HOST` 环境变量指定：
+
+```powershell
+# 本地测试
+$env:TARGET_HOST="http://localhost:8000"
+
+# 生产环境
+$env:TARGET_HOST="https://your-app.azurecontainerapps.io"
+```
+
+---
+
+### E2E 测试
+
+**测试 1：单用户冒烟测试（确认链路通）**
+
+```powershell
+python -m locust -f scripts/locustfile.py --host=http://localhost:8000 --users=1 --spawn-rate=1 --run-time=30s --headless
+```
+
+预期：
+- [ ] 所有请求返回 200
+- [ ] 无 failure
+- [ ] 终端显示 Locust 统计摘要（Requests、Failures、P50、P95 等）
+
+**测试 2：10 并发用户压测**
+
+```powershell
+python -m locust -f scripts/locustfile.py --host=http://localhost:8000 --users=10 --spawn-rate=2 --run-time=3m --headless --csv=reports/test_10_users
+```
+
+预期：
+- [ ] 测试顺利跑完 3 分钟
+- [ ] `reports/` 目录下生成 `test_10_users_stats.csv`、`test_10_users_stats_history.csv`、`test_10_users_failures.csv`
+- [ ] failure rate < 5%（允许偶发限流）
+
+**测试 3：自动化阶梯压测（完整流程）**
+
+```powershell
+# 只跑 10+50 两级（节省时间验证流程）
+python scripts/run_loadtest.py --host http://localhost:8000 --levels 10,50
+
+# 完整四级（生产环境建议在非工作时间）
+python scripts/run_loadtest.py --host https://your-app.azurecontainerapps.io
+```
+
+预期：
+- [ ] 每个并发级别依次执行
+- [ ] `reports/` 目录生成各级 CSV 文件
+- [ ] 自动生成 `reports/loadtest_report_{timestamp}.md`
+
+**测试 4：报告内容验证**
+
+打开生成的 `reports/loadtest_report_{timestamp}.md`：
+
+- [ ] 包含 Summary 汇总表（Concurrent Users / Requests / Failures / P95 / P99 / RPS）
+- [ ] 包含 Per-Level Details（每级详细指标）
+- [ ] 包含 Cache Hit Rate 说明
+- [ ] 包含 Bottleneck Analysis（失败分析、延迟趋势）
+- [ ] 包含 Scaling Recommendations（Azure OpenAI quota、Container Apps 扩缩容等建议）
+
+**测试 5：已有功能回归（压测不修改任何已有代码）**
+
+```powershell
+# 压测结束后验证生产环境仍正常
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/v1/chat/answer" -ContentType "application/json" -Body '{"message":"What dental benefits are covered?","history":[]}'
+```
+
+预期：
+- [ ] 回答正常返回
+- [ ] Streamlit http://localhost:8501 正常加载
+- [ ] 压测未修改任何后端/前端代码
+
+---
+
+### 常见问题
+
+- **`ModuleNotFoundError: locust`** → 在本地（非 Docker）安装：`pip install -r requirements-test.txt`
+- **所有请求失败 (ConnectionError)** → 检查 `--host` 是否正确，后端是否运行中
+- **大量 429 错误** → Azure OpenAI 限流，这是预期行为；报告会记录限流开始的并发级别
+- **Locust 本地 CPU 满载** → 500 并发可能需要分布式 Locust workers
+- **CSV 文件未生成** → 检查 `reports/` 目录是否存在；确认 `--csv` 路径正确
