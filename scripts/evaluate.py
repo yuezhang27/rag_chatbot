@@ -1,5 +1,5 @@
 """
-RAGAS 离线评估脚本 — Day 8
+RAGAS 离线评估脚本
 
 对 eval_dataset.json 里的每道题跑完整 RAG pipeline，
 用 RAGAS 计算 Faithfulness / AnswerRelevancy / ContextPrecision 三维度分数。

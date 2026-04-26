@@ -1,10 +1,6 @@
 """
 ChromaDB persistent store and Azure OpenAI embedding helpers.
 Config from .env: AZURE_OPENAI_*, used for batch embedding and vector search.
-
-说明：
-- 当前是 Day2~Day4 的本地检索实现（Chroma 向量检索）
-- Day5 会引入 SearchClient Adapter（Chroma 本地 / Azure AI Search 生产）
 """
 import os
 import time

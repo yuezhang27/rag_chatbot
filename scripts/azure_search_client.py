@@ -1,5 +1,5 @@
 """
-Azure AI Search 生产检索适配器（Day 5）。
+Azure AI Search 生产检索适配器。
 
 检索策略：
     Hybrid 召回 top-20（BM25 关键词 + 向量 RRF 融合）

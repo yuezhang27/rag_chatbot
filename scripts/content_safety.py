@@ -1,5 +1,5 @@
 """
-Azure AI Content Safety 封装（Day 13）。
+Azure AI Content Safety 封装。
 
 提供三个检查函数：
 - check_prompt_shield: Prompt Shields API，检测 prompt injection / jailbreak

@@ -1,5 +1,5 @@
 """
-Retrieval Adapter Layer (Day 5).
+Retrieval Adapter Layer.
 
 Defines the SearchClient interface and factory.
 All retrieval goes through this layer — callers never touch Chroma or Azure SDK directly.

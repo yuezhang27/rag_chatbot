@@ -2,7 +2,7 @@
 PDF text extraction. Supports local (PyMuPDF) and Azure Document Intelligence.
 
 backend="local": PyMuPDF 纯文本提取（开发用）
-backend="azure": Azure Document Intelligence Layout 模型（生产用，Day 11 升级）
+backend="azure": Azure Document Intelligence Layout 模型（生产用）
     - 表格 → Markdown 表格格式
     - 需设置 AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT / AZURE_DOCUMENT_INTELLIGENCE_KEY
       （也兼容旧名 DOCINTELLIGENCE_ENDPOINT / DOCINTELLIGENCE_KEY）
@@ -200,7 +200,7 @@ def _build_page_content_with_tables(result) -> List[Tuple[int, str]]:
 
 
 # ---------------------------------------------------------------------------
-# Azure Document Intelligence parser (Day 11 升级版)
+# Azure Document Intelligence parser
 # ---------------------------------------------------------------------------
 
 
@@ -225,7 +225,7 @@ def parse_pdf_azure(
     )
     result = poller.result(timeout=_DI_POLLING_TIMEOUT)
 
-    # Day 11: 使用带表格 Markdown 的提取
+    # 使用带表格 Markdown 的提取
     pages = _build_page_content_with_tables(result)
     return "\n\n".join(text for _, text in pages)
 
@@ -237,10 +237,7 @@ def parse_pdf_azure_pages(
     key: str | None = None,
     model_id: str = "prebuilt-layout",
 ) -> List[Tuple[int, str]]:
-    """使用 Azure Document Intelligence 按页返回文本（含表格 Markdown）。
-
-    Day 11 升级：表格不再提取为乱文本，而是转换为结构化 Markdown 表格。
-    """
+    """使用 Azure Document Intelligence 按页返回文本（含表格 Markdown）。"""
     endpoint, key = _get_di_credentials(endpoint, key)
 
     from azure.ai.documentintelligence import DocumentIntelligenceClient

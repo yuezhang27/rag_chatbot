@@ -1,5 +1,5 @@
 """
-Redis 语义缓存（Day 12）。
+Redis 语义缓存。
 
 用 query embedding 的余弦相似度做语义匹配：
 - 命中（≥ threshold）→ 返回缓存的 response + citations

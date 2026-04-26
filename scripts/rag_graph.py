@@ -1,5 +1,5 @@
 """
-LangGraph RAG 编排（Day 10 + Day 12 Semantic Cache + Day 13 Dual Guardrails）。
+LangGraph RAG 编排（Semantic Cache + Dual Guardrails）。
 
 状态图：cache_check → [条件] → content_safety_check → [条件] → nemo_guardrails_check → [条件] → retrieve → build_prompt → generate → cache_write
 缓存命中时跳过 guardrails + RAG，直接到 END。
@@ -33,12 +33,12 @@ class RAGState(TypedDict, total=False):
     citations: List[dict]              # [{filename, page, snippet}]
     prompt_messages: List[dict]        # final messages list for LLM
     response: str                      # full generated text
-    # Day 12: cache fields
+    # cache fields
     cache_hit: bool
     cached_response: Optional[str]
     cached_citations: Optional[List[dict]]
     query_embedding: Optional[List[float]]  # for cache_write
-    # Day 13: guardrails fields
+    # guardrails fields
     guardrail_denied: bool
     denial_message: Optional[str]
     pii_detected: Optional[list]
@@ -101,7 +101,7 @@ def _make_snippet(text: str, max_chars: int = 120) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Cache nodes (Day 12)
+# Cache nodes
 # ---------------------------------------------------------------------------
 
 def cache_check_node(state: RAGState) -> dict:
@@ -162,7 +162,7 @@ def cache_write_node(state: RAGState) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Guardrails nodes (Day 13)
+# Guardrails nodes
 # ---------------------------------------------------------------------------
 
 def content_safety_check_node(state: RAGState) -> dict:
@@ -355,7 +355,7 @@ def generate_node(state: RAGState) -> dict:
 # ---------------------------------------------------------------------------
 
 def build_rag_graph() -> StateGraph:
-    """构建 RAG 状态图（Day 13: 含缓存 + 双层 Guardrails）。
+    """构建 RAG 状态图（含缓存 + 双层 Guardrails）。
 
     cache_check → [条件边]
         ├─ cache_hit  → END（跳过 guardrails，缓存内容已通过安全检查）
