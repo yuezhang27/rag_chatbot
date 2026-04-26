@@ -55,3 +55,14 @@ chroma_db/
 # =========================
 *.pdf
 data/
+
+# =========================
+# Learning artifacts (local only)
+# =========================
+dev_progress/
+TODO.md
+AGENTS.md
+PRD.md
+ADR.md
+policy.txt
+test.py
