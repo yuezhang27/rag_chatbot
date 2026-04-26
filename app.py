@@ -82,7 +82,6 @@ class ChatRequest(BaseModel):
 
 
 class Citation(BaseModel):
-    # Day5 增强：文件名 + 页码 + 片段文本（~20 tokens）
     filename: str
     page: int
     snippet: str = ""
@@ -159,28 +158,6 @@ def create_conversation_if_needed(conversation_id: Optional[str]) -> str:
     return str(uuid4())
 
 
-# 下面这整段关键词检索与消息落库逻辑先保留为注释，不直接删除。
-# 原因：它对应 Day1 的 SQLite LIKE 检索与早期会话持久化方案；
-# 现在按 PRD/ADR（Day2~Day4）切换到 Chroma 向量检索 + 前端维护 history。
-# def save_message(conversation_id: int, role: str, content: str) -> int:
-#     conn = get_db_connection()
-#     cursor = conn.cursor()
-#     now = datetime.utcnow().isoformat()
-#     cursor.execute(
-#         "INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-#         (conversation_id, role, content, now),
-#     )
-#     conn.commit()
-#     message_id = cursor.lastrowid
-#     conn.close()
-#     return message_id
-#
-#
-# def retrieve_docs(question: str, top_k: int) -> List[sqlite3.Row]:
-#     ...
-
-
-# Day10: SYSTEM_PROMPT 统一定义在 rag_graph.py，此处保留别名以兼容
 SYSTEM_PROMPT = _GRAPH_SYSTEM_PROMPT
 
 
@@ -232,41 +209,12 @@ def _sse_event(event: str, data: dict) -> bytes:
     payload = json.dumps(data, ensure_ascii=False)
     return f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
 
-# 下面保留旧的上传 API（注释），不直接删除：
-# 它对应 Day1 时"管理员通过后端接口上传文档"的实现。
-# 当前按 PRD/ADR 收敛：文档 ingestion 改为手动脚本 scripts/prepdocs.py，
-# 因为 HR 文档更新频率低，上传 UI/API ROI 不高。
-# @app.post("/admin/documents/upload")
-# def admin_upload_pdf(file: UploadFile = File(...), parser: str = "local"):
-#     ...
-
-
-"""
----
-THIS IS USED TO TEST LLM WORKS. PLEASE GO TO http://localhost:8000/v1/chat/test
----
-"""
-# @app.get("/v1/chat/test")
-# def chat_test():
-#     client = get_client()
-#     question = "How many seconds are there in an hour?"
-#     completion = client.chat.completions.create(
-#         model="gpt-4o-mini",
-#         messages=[
-#             {"role": "system", "content": "You are a helpful assistant."},
-#             {"role": "user", "content": question},
-#         ],
-#     )
-#     answer = completion.choices[0].message.content
-#     return {"test_question": question, "answer": answer}
-
 
 @app.post("/v1/chat/answer", response_model=ChatResponse)
 def chat_answer(request: ChatRequest):
-    """非流式回答（LangGraph 编排版 + Day 12 语义缓存 + Day 13 Guardrails）。
+    """非流式回答（LangGraph 编排 + 语义缓存 + Guardrails）。
 
-    Day 15: Langfuse 手动埋点已移除。LangSmith 通过 env vars 自动捕获
-    LangChain/LangGraph 调用，无需代码。
+    LangSmith 通过环境变量自动捕获 LangChain/LangGraph 调用链路。
     """
     conversation_id = create_conversation_if_needed(request.conversation_id)
 
@@ -309,7 +257,7 @@ def chat_answer(request: ChatRequest):
         )
         return ChatResponse(conversation_id=conversation_id, answer=answer, citations=citations)
 
-    # ── Day 13: Guardrails (after cache miss) ─────────────────────────────────
+    # ── Guardrails (after cache miss) ────────────────────────────────────────
     # Layer 1: Azure Content Safety
     cs_result = content_safety_check_node(state)
     state.update(cs_result)
@@ -363,14 +311,12 @@ def chat_answer(request: ChatRequest):
 
 @app.post("/v1/chat/stream")
 def chat_stream(request: ChatRequest):
-    """流式主接口（SSE）— LangGraph 编排版 + Day 12 语义缓存 + Day 13 Guardrails。
+    """流式主接口（SSE）— LangGraph 编排 + 语义缓存 + Guardrails。
 
-    协议不变：citation_data → response_text → done。
+    协议：citation_data → response_text → done。
     缓存命中时 response_text 一次性发完（非逐字流式）。
     被拒绝时 SSE 返回空 citations + 拒答提示。
-
-    Day 15: Langfuse 手动埋点已移除。LangSmith 通过 env vars 自动捕获
-    LangChain/LangGraph 调用，无需代码。
+    LangSmith 通过环境变量自动捕获 LangChain/LangGraph 调用链路。
     """
     conversation_id = create_conversation_if_needed(request.conversation_id)
 
@@ -420,7 +366,7 @@ def chat_stream(request: ChatRequest):
 
         return StreamingResponse(cached_event_generator(), media_type="text/event-stream")
 
-    # ── Day 13: Guardrails (after cache miss) ─────────────────────────────────
+    # ── Guardrails (after cache miss) ────────────────────────────────────────
     # Layer 1: Azure Content Safety
     cs_result = content_safety_check_node(state)
     state.update(cs_result)
@@ -499,14 +445,6 @@ def chat_stream(request: ChatRequest):
         )
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-
-# 保留旧 Ask 独立接口（注释，不删除）：
-# 原实现对应"Chat/Ask 双接口"。
-# 当前按 ADR 收敛：Ask = history 为空的 Chat，请统一走 /v1/chat/stream。
-# @app.post("/v1/ask/stream")
-# def ask_stream(request: AskRequest):
-#     ...
 
 
 @app.post("/v1/feedback")
