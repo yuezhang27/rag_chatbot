@@ -1,23 +1,23 @@
 """
-Redis 语义缓存。
+GPTCache 语义缓存（Redis 后端）。
 
-用 query embedding 的余弦相似度做语义匹配：
-- 命中（≥ threshold）→ 返回缓存的 response + citations
-- 未命中 → 返回 None，由调用方走完整 RAG 链路后回写
+用 GPTCache 管理缓存的核心逻辑（相似度匹配、存储管理、eviction），
+Redis 作为标量存储后端，本地向量索引做相似度搜索。
 
-降级策略：Redis 不可用 / CACHE_ENABLED=false → 所有操作静默跳过，不阻断主链路。
+公共 API：
+- cache_lookup(query: str) -> Optional[dict]  — 语义查找缓存
+- cache_store(query: str, response: str, citations: list) -> None — 写入缓存
+
+降级策略：GPTCache / Redis 不可用 / CACHE_ENABLED=false → 所有操作静默跳过，不阻断主链路。
 """
 import json
 import logging
-import math
 import os
-from datetime import datetime
 from typing import List, Optional
-from uuid import uuid4
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
-
-_CACHE_KEY_PREFIX = "rag:cache:"
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -32,41 +32,68 @@ def _get_similarity_threshold() -> float:
     return float(os.environ.get("CACHE_SIMILARITY_THRESHOLD", "0.95"))
 
 
-def _get_redis_client():
-    """Return a Redis client or None if unavailable."""
-    url = os.environ.get("REDIS_URL", "")
-    if not url:
+# ---------------------------------------------------------------------------
+# GPTCache singleton
+# ---------------------------------------------------------------------------
+
+_gptcache_instance = None
+_gptcache_init_failed = False
+
+
+def _embed_query(data: dict) -> np.ndarray:
+    """GPTCache embedding callback: embed the query text via Azure OpenAI."""
+    from scripts.chroma_embed import embed_texts_batch
+
+    query = data.get("query", "") or data.get("prompt", "") or str(data)
+    if isinstance(query, list):
+        query = query[0] if query else ""
+    embeddings = embed_texts_batch([query])
+    return np.array(embeddings[0], dtype="float32")
+
+
+def _get_cache():
+    """Return the GPTCache Cache instance, initializing on first call."""
+    global _gptcache_instance, _gptcache_init_failed
+
+    if _gptcache_init_failed:
         return None
+    if _gptcache_instance is not None:
+        return _gptcache_instance
+
+    redis_url = os.environ.get("REDIS_URL", "")
+    if not redis_url:
+        _gptcache_init_failed = True
+        return None
+
     try:
-        import redis
-        client = redis.from_url(url, decode_responses=True, socket_timeout=2)
-        client.ping()
-        return client
+        from gptcache import Cache
+        from gptcache.manager import CacheBase, VectorBase, get_data_manager
+        from gptcache.similarity_evaluation import SearchDistanceEvaluation
+
+        cache_base = CacheBase("redis", redis_url=redis_url)
+        vector_base = VectorBase(
+            "numpy",
+            dimension=int(os.environ.get("EMBEDDING_DIMENSIONS", "3072")),
+            top_k=1,
+        )
+        data_manager = get_data_manager(cache_base, vector_base)
+
+        cache = Cache()
+        cache.init(
+            pre_embedding_func=lambda kwargs: kwargs.get("prompt", ""),
+            embedding_func=_embed_query,
+            data_manager=data_manager,
+            similarity_evaluation=SearchDistanceEvaluation(),
+        )
+
+        _gptcache_instance = cache
+        logger.info("GPTCache initialized with Redis backend")
+        return cache
+
     except Exception as exc:
-        logger.warning("Redis not available: %s", exc)
+        logger.warning("GPTCache init failed, degrading to no-cache: %s", exc)
+        _gptcache_init_failed = True
         return None
-
-
-# ---------------------------------------------------------------------------
-# Cosine similarity (pure-Python, no numpy dependency)
-# ---------------------------------------------------------------------------
-
-
-def _cosine_similarity(a: List[float], b: List[float]) -> float:
-    """Compute cosine similarity between two vectors."""
-    if len(a) != len(b):
-        return 0.0
-    dot = 0.0
-    norm_a = 0.0
-    norm_b = 0.0
-    for x, y in zip(a, b):
-        dot += x * y
-        norm_a += x * x
-        norm_b += y * y
-    denom = math.sqrt(norm_a) * math.sqrt(norm_b)
-    if denom == 0:
-        return 0.0
-    return dot / denom
 
 
 # ---------------------------------------------------------------------------
@@ -74,8 +101,11 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
 # ---------------------------------------------------------------------------
 
 
-def cache_lookup(query_embedding: List[float]) -> Optional[dict]:
-    """在 Redis 中查找语义相似的已缓存回答。
+def cache_lookup(query: str) -> Optional[dict]:
+    """在 GPTCache 中查找语义相似的已缓存回答。
+
+    Args:
+        query: 原始查询文本（GPTCache 内部管理 embedding 计算）
 
     Returns:
         命中时返回 {"response": str, "citations": list}，
@@ -84,46 +114,32 @@ def cache_lookup(query_embedding: List[float]) -> Optional[dict]:
     if not _is_cache_enabled():
         return None
 
-    r = _get_redis_client()
-    if r is None:
+    cache = _get_cache()
+    if cache is None:
         return None
 
     try:
-        threshold = _get_similarity_threshold()
-        keys = r.keys(f"{_CACHE_KEY_PREFIX}*")
-        if not keys:
+        result = cache.get(prompt=query)
+        if result is None:
             return None
 
-        best_score = 0.0
-        best_entry = None
-
-        for key in keys:
-            raw = r.get(key)
-            if not raw:
-                continue
+        # GPTCache returns the stored string; we JSON-decode it
+        if isinstance(result, str):
             try:
-                entry = json.loads(raw)
+                entry = json.loads(result)
             except (json.JSONDecodeError, TypeError):
-                continue
-            emb = entry.get("embedding")
-            if not emb:
-                continue
-            score = _cosine_similarity(query_embedding, emb)
-            if score >= threshold and score > best_score:
-                best_score = score
-                best_entry = entry
+                entry = {"response": result, "citations": []}
+        elif isinstance(result, dict):
+            entry = result
+        else:
+            return None
 
-        if best_entry:
-            logger.info(
-                "Cache HIT (score=%.4f, query=%s)",
-                best_score,
-                best_entry.get("query", "")[:60],
-            )
-            return {
-                "response": best_entry["response"],
-                "citations": best_entry.get("citations", []),
-            }
-        return None
+        threshold = _get_similarity_threshold()
+        logger.info("Cache HIT: query=%s", query[:60])
+        return {
+            "response": entry.get("response", str(result)),
+            "citations": entry.get("citations", []),
+        }
 
     except Exception as exc:
         logger.warning("Cache lookup failed, degrading to miss: %s", exc)
@@ -132,31 +148,29 @@ def cache_lookup(query_embedding: List[float]) -> Optional[dict]:
 
 def cache_store(
     query: str,
-    query_embedding: List[float],
     response: str,
     citations: list,
 ) -> None:
-    """将 query + response + citations 写入 Redis 缓存。
+    """将 query + response + citations 写入 GPTCache。
 
+    GPTCache 内部管理 embedding 计算和存储。
     写入失败只 log warning，不阻塞主链路。
     """
     if not _is_cache_enabled():
         return
 
-    r = _get_redis_client()
-    if r is None:
+    cache = _get_cache()
+    if cache is None:
         return
 
     try:
-        entry = {
-            "query": query,
-            "embedding": query_embedding,
+        # Store as JSON so we can recover citations on lookup
+        entry = json.dumps({
             "response": response,
             "citations": citations,
-            "created_at": datetime.utcnow().isoformat(),
-        }
-        key = f"{_CACHE_KEY_PREFIX}{uuid4().hex[:12]}"
-        r.set(key, json.dumps(entry, ensure_ascii=False))
-        logger.info("Cache STORE: key=%s query=%s", key, query[:60])
+        }, ensure_ascii=False)
+
+        cache.put(prompt=query, data=entry)
+        logger.info("Cache STORE: query=%s", query[:60])
     except Exception as exc:
         logger.warning("Cache store failed: %s", exc)

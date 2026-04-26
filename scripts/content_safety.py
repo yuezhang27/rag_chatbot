@@ -126,30 +126,64 @@ def check_content_filter(text: str) -> dict:
         return {"safe": True}
 
 
+def _get_language_client():
+    """Return Azure AI Language TextAnalyticsClient or None if unavailable."""
+    endpoint = os.environ.get("AZURE_LANGUAGE_ENDPOINT", "")
+    key = os.environ.get("AZURE_LANGUAGE_KEY", "")
+    if not endpoint or not key:
+        return None
+    try:
+        from azure.ai.textanalytics import TextAnalyticsClient
+        from azure.core.credentials import AzureKeyCredential
+        client = TextAnalyticsClient(
+            endpoint=endpoint,
+            credential=AzureKeyCredential(key),
+        )
+        return client
+    except Exception as exc:
+        logger.warning("Language client init failed: %s", exc)
+        return None
+
+
 def detect_pii(text: str) -> dict:
-    """PII 检测。
+    """PII 检测 via Azure AI Language PII Detection API.
 
     Returns:
-        {"entities": []} 无 PII，或 {"entities": [...]} 含 PII 实体列表。
-        检测到 PII 时仅 log warning，不硬拒绝（除非包含他人 PII 相关模式）。
-    """
-    if not _is_guardrails_enabled():
-        return {"entities": []}
+        {"entities": [...], "redacted_text": str}
+        entities 列表每项: {"text": str, "category": str, "confidence": float}
+        redacted_text: 脱敏后文本（PII 替换为 [REDACTED]）
 
-    client = _get_content_safety_client()
+    降级策略：Azure AI Language 不可用时返回空实体 + 原文。
+    """
+    default = {"entities": [], "redacted_text": text}
+
+    if not _is_guardrails_enabled():
+        return default
+
+    client = _get_language_client()
     if client is None:
-        return {"entities": []}
+        return default
 
     try:
-        # Azure Content Safety PII detection
-        # Use the text analysis to detect PII patterns
-        from azure.ai.contentsafety.models import AnalyzeTextOptions
-        # Note: PII detection may require specific API features
-        # For now, use a simple heuristic approach as fallback
-        # The actual Azure PII detection is via Azure AI Language service
-        # Content Safety SDK may not directly expose PII detection
-        logger.debug("PII detection: using heuristic check for text length=%d", len(text))
-        return {"entities": []}
+        response = client.recognize_pii_entities(
+            documents=[text],
+            language="zh",
+        )
+        result = response[0]
+        if result.is_error:
+            logger.warning("PII detection API error: %s", result.error)
+            return default
+
+        entities = [
+            {
+                "text": entity.text,
+                "category": entity.category,
+                "confidence": entity.confidence_score,
+            }
+            for entity in result.entities
+        ]
+        redacted = result.redacted_text or text
+        return {"entities": entities, "redacted_text": redacted}
     except Exception as exc:
         logger.warning("PII detection failed, degrading to allow: %s", exc)
-        return {"entities": []}
+        return default

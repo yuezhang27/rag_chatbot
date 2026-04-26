@@ -221,6 +221,7 @@ def chat_answer(request: ChatRequest):
     from scripts.rag_graph import (
         cache_check_node, retrieve_node, build_prompt_node, cache_write_node,
         content_safety_check_node, nemo_guardrails_check_node,
+        output_safety_check_node,
     )
 
     history_dicts = [{"role": m.role, "content": m.content} for m in (request.history or [])]
@@ -295,8 +296,14 @@ def chat_answer(request: ChatRequest):
     answer = result.content or ""
     state["response"] = answer
 
-    # Cache write
-    cache_write_node(state)
+    # Output safety check (content filter + PII redaction on LLM output)
+    output_result = output_safety_check_node(state)
+    state.update(output_result)
+    answer = state.get("response", answer)
+
+    # Cache write (skip if output was replaced — don't cache denied answers)
+    if not state.get("output_replaced", False):
+        cache_write_node(state)
 
     retrieved = state.get("contexts", [])
     citations = _build_citations_from_retrieved(retrieved)
@@ -323,6 +330,7 @@ def chat_stream(request: ChatRequest):
     from scripts.rag_graph import (
         cache_check_node, retrieve_node, build_prompt_node, cache_write_node,
         content_safety_check_node, nemo_guardrails_check_node,
+        output_safety_check_node,
     )
 
     history_dicts = [{"role": m.role, "content": m.content} for m in (request.history or [])]
@@ -431,16 +439,29 @@ def chat_stream(request: ChatRequest):
             full_text += text
             yield _sse_event("response_text", {"text": text})
 
-        yield _sse_event("done", {"conversation_id": conversation_id})
-
-        # Cache write after generation complete
+        # Output safety check after full text collected
         state["response"] = full_text
-        cache_write_node(state)
+        output_result = output_safety_check_node(state)
+        state.update(output_result)
+
+        if state.get("output_replaced", False):
+            replacement = state.get("replacement_text", full_text)
+            yield _sse_event("done", {
+                "conversation_id": conversation_id,
+                "replaced": True,
+                "replacement_text": replacement,
+            })
+            final_answer = replacement
+        else:
+            yield _sse_event("done", {"conversation_id": conversation_id})
+            final_answer = full_text
+            # Cache write only when output is safe
+            cache_write_node(state)
 
         _save_conversation_to_blob(
             conversation_id=conversation_id,
             history=request.history or [],
-            answer=full_text,
+            answer=final_answer,
             citations=_build_citations_from_retrieved(retrieved),
         )
 

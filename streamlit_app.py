@@ -90,6 +90,12 @@ def stream_chat(message: str, history: list, conversation_id: str | None):
             cid = payload.get("conversation_id")
             if cid:
                 new_conversation_id = cid
+            # Output safety replacement: if backend flagged the response
+            if payload.get("replaced"):
+                replacement = payload.get("replacement_text", "")
+                full_text = replacement
+                st.session_state._output_replaced = True
+                st.session_state._replacement_text = replacement
 
     # 将结果存到 session_state（通过闭包外部变量传递）
     st.session_state._last_citations = citations
@@ -182,6 +188,8 @@ def chat_page():
             st.session_state._last_citations = []
             st.session_state._last_conversation_id = st.session_state.conversation_id
             st.session_state._last_full_text = ""
+            st.session_state._output_replaced = False
+            st.session_state._replacement_text = ""
 
             generator = stream_chat(
                 prompt,
@@ -192,6 +200,11 @@ def chat_page():
                 full_response = st.write_stream(generator)
             except Exception:
                 full_response = st.session_state._last_full_text
+
+            # If output was replaced by safety check, show replacement text
+            if st.session_state.get("_output_replaced", False):
+                full_response = st.session_state._replacement_text
+                st.warning(full_response)
 
             citations = st.session_state._last_citations
             st.session_state.conversation_id = st.session_state._last_conversation_id
@@ -231,12 +244,18 @@ def ask_page():
             st.session_state._last_citations = []
             st.session_state._last_conversation_id = None
             st.session_state._last_full_text = ""
+            st.session_state._output_replaced = False
+            st.session_state._replacement_text = ""
 
             generator = stream_chat(prompt, [], None)
             try:
                 full_response = st.write_stream(generator)
             except Exception:
                 full_response = st.session_state._last_full_text
+
+            if st.session_state.get("_output_replaced", False):
+                full_response = st.session_state._replacement_text
+                st.warning(full_response)
 
             citations = st.session_state._last_citations
             render_citations(citations)

@@ -1,9 +1,10 @@
 """
-LangGraph RAG 编排（Semantic Cache + Dual Guardrails）。
+LangGraph RAG 编排（Semantic Cache + Dual Guardrails + Output Safety）。
 
-状态图：cache_check → [条件] → content_safety_check → [条件] → nemo_guardrails_check → [条件] → retrieve → build_prompt → generate → cache_write
+状态图：cache_check → [条件] → content_safety_check → [条件] → nemo_guardrails_check → [条件] → retrieve → build_prompt → generate → output_safety_check → [条件] → cache_write
 缓存命中时跳过 guardrails + RAG，直接到 END。
 Guardrails 拒绝时短路到 END，不进入 RAG 链路。
+Output 安全检查拒绝时跳过 cache_write，不缓存被拒回答。
 对外导出 compiled_graph 供 app.py 调用。
 """
 import logging
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 class RAGState(TypedDict, total=False):
     query: str
+    original_query: Optional[str]      # pre-redaction query (for cache matching)
     history: List[dict]                # [{"role": ..., "content": ...}]
     conversation_id: str
     top_k: int
@@ -42,6 +44,9 @@ class RAGState(TypedDict, total=False):
     guardrail_denied: bool
     denial_message: Optional[str]
     pii_detected: Optional[list]
+    # output safety fields
+    output_replaced: bool
+    replacement_text: Optional[str]
 
 
 # ---------------------------------------------------------------------------
@@ -105,32 +110,33 @@ def _make_snippet(text: str, max_chars: int = 120) -> str:
 # ---------------------------------------------------------------------------
 
 def cache_check_node(state: RAGState) -> dict:
-    """缓存检查节点：计算 query embedding → Redis 语义查找。
+    """缓存检查节点：GPTCache 语义查找。
 
+    GPTCache 内部管理 embedding 计算和相似度匹配。
     命中时写入 cached_response + cached_citations + cache_hit=True。
-    未命中或异常时 cache_hit=False。
+    未命中时计算 query_embedding 供后续节点使用。
     """
     try:
         from scripts.cache import cache_lookup
-        from scripts.chroma_embed import embed_texts_batch
 
         query = state["query"]
-        embeddings = embed_texts_batch([query])
-        query_embedding = embeddings[0]
+        cached = cache_lookup(query)
 
-        cached = cache_lookup(query_embedding)
         if cached is not None:
             return {
                 "cache_hit": True,
                 "cached_response": cached["response"],
                 "cached_citations": cached.get("citations", []),
-                "query_embedding": query_embedding,
                 "response": cached["response"],
                 "citations": cached.get("citations", []),
             }
+
+        # Cache miss: compute query_embedding for downstream nodes
+        from scripts.chroma_embed import embed_texts_batch
+        embeddings = embed_texts_batch([query])
         return {
             "cache_hit": False,
-            "query_embedding": query_embedding,
+            "query_embedding": embeddings[0],
         }
     except Exception as exc:
         logger.warning("cache_check failed, degrading to miss: %s", exc)
@@ -145,17 +151,16 @@ def _cache_route(state: RAGState) -> str:
 
 
 def cache_write_node(state: RAGState) -> dict:
-    """缓存回写节点：将 RAG 结果写入 Redis。写入失败不阻塞。"""
+    """缓存回写节点：将 RAG 结果写入 GPTCache。写入失败不阻塞。"""
     try:
         from scripts.cache import cache_store
 
         query = state.get("query", "")
-        query_embedding = state.get("query_embedding")
         response = state.get("response", "")
         citations = state.get("citations", [])
 
-        if query_embedding and response:
-            cache_store(query, query_embedding, response, citations)
+        if response:
+            cache_store(query, response, citations)
     except Exception as exc:
         logger.warning("cache_write failed: %s", exc)
     return {}
@@ -198,16 +203,18 @@ def content_safety_check_node(state: RAGState) -> dict:
                 "denial_message": "抱歉，该内容不在本系统的服务范围内。",
             }
 
-        # 3) PII Detection — log warning only, don't hard deny
+        # 3) PII Detection — redact input, don't hard deny
         pii_result = detect_pii(query)
         pii_entities = pii_result.get("entities", [])
+        result: dict = {"guardrail_denied": False, "pii_detected": pii_entities}
+
         if pii_entities:
             logger.warning("PII detected in query: %s", pii_entities)
+            redacted_text = pii_result.get("redacted_text", query)
+            result["original_query"] = query
+            result["query"] = redacted_text
 
-        return {
-            "guardrail_denied": False,
-            "pii_detected": pii_entities,
-        }
+        return result
     except Exception as exc:
         logger.warning("content_safety_check failed, degrading to allow: %s", exc)
         return {"guardrail_denied": False}
@@ -351,11 +358,68 @@ def generate_node(state: RAGState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Output safety check node
+# ---------------------------------------------------------------------------
+
+def output_safety_check_node(state: RAGState) -> dict:
+    """Output 层安全检查：对 LLM 生成文本做内容过滤 + PII 脱敏。
+
+    1. check_content_filter → 有害内容 → 替换为安全提示
+    2. detect_pii → 脱敏输出中的 PII
+    两个检查都通过 → response 不变。
+    """
+    from scripts.content_safety import check_content_filter, detect_pii, _is_guardrails_enabled
+
+    if not _is_guardrails_enabled():
+        return {"output_replaced": False}
+
+    response = state.get("response", "")
+    if not response:
+        return {"output_replaced": False}
+
+    try:
+        # 1) Content filter on output
+        filter_result = check_content_filter(response)
+        if not filter_result.get("safe", True):
+            logger.warning("Output content filter DENY: category=%s", filter_result.get("category"))
+            replacement = "抱歉，系统生成的回答包含不适当内容，请换个方式提问。"
+            return {
+                "response": replacement,
+                "output_replaced": True,
+                "replacement_text": replacement,
+            }
+
+        # 2) PII detection on output
+        pii_result = detect_pii(response)
+        pii_entities = pii_result.get("entities", [])
+        if pii_entities:
+            logger.warning("PII detected in output: %s", pii_entities)
+            redacted = pii_result.get("redacted_text", response)
+            return {
+                "response": redacted,
+                "output_replaced": True,
+                "replacement_text": redacted,
+            }
+
+        return {"output_replaced": False}
+    except Exception as exc:
+        logger.warning("output_safety_check failed, degrading to allow: %s", exc)
+        return {"output_replaced": False}
+
+
+def _output_safety_route(state: RAGState) -> str:
+    """条件边：output replaced → skip cache_write, otherwise → cache_write."""
+    if state.get("output_replaced", False):
+        return "replaced"
+    return "safe"
+
+
+# ---------------------------------------------------------------------------
 # Build & compile graph
 # ---------------------------------------------------------------------------
 
 def build_rag_graph() -> StateGraph:
-    """构建 RAG 状态图（含缓存 + 双层 Guardrails）。
+    """构建 RAG 状态图（含缓存 + 双层 Guardrails + Output 安全检查）。
 
     cache_check → [条件边]
         ├─ cache_hit  → END（跳过 guardrails，缓存内容已通过安全检查）
@@ -363,7 +427,9 @@ def build_rag_graph() -> StateGraph:
                           ├─ denied → END
                           └─ allowed → nemo_guardrails_check → [条件边]
                                         ├─ denied → END
-                                        └─ allowed → retrieve → build_prompt → generate → cache_write → END
+                                        └─ allowed → retrieve → build_prompt → generate → output_safety_check → [条件边]
+                                                                                           ├─ replaced → END（不缓存被拒回答）
+                                                                                           └─ safe → cache_write → END
     """
     graph = StateGraph(RAGState)
 
@@ -373,6 +439,7 @@ def build_rag_graph() -> StateGraph:
     graph.add_node("retrieve", retrieve_node)
     graph.add_node("build_prompt", build_prompt_node)
     graph.add_node("generate", generate_node)
+    graph.add_node("output_safety_check", output_safety_check_node)
     graph.add_node("cache_write", cache_write_node)
 
     graph.add_edge(START, "cache_check")
@@ -393,7 +460,12 @@ def build_rag_graph() -> StateGraph:
     )
     graph.add_edge("retrieve", "build_prompt")
     graph.add_edge("build_prompt", "generate")
-    graph.add_edge("generate", "cache_write")
+    graph.add_edge("generate", "output_safety_check")
+    graph.add_conditional_edges(
+        "output_safety_check",
+        _output_safety_route,
+        {"replaced": END, "safe": "cache_write"},
+    )
     graph.add_edge("cache_write", END)
 
     return graph
