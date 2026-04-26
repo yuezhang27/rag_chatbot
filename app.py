@@ -1,9 +1,8 @@
 import json
 import logging
 import os
-import sqlite3
 from datetime import datetime
-from typing import List, Optional, Union
+from typing import List, Optional
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -67,61 +66,6 @@ def _save_conversation_to_blob(
         logger.error("Blob write failed: conversation_id=%s error=%s", conversation_id, exc)
 
 
-DATABASE_PATH = "chatbot.db"
-
-
-def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db() -> None:
-    """初始化本地 SQLite。
-
-    说明：Day1/Day2 对齐后，核心检索数据在 ChromaDB；这里保留 docs 表作为
-    可选调试与回溯用途，便于你学习数据流与排查 ingestion。
-    """
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS docs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            page_number INTEGER,
-            chunk TEXT,
-            created_at TEXT
-        )
-        """
-    )
-
-    # 兼容旧库：若 docs 是历史表结构（无 page_number），在启动时自动补列。
-    cursor.execute("PRAGMA table_info(docs)")
-    columns = {row[1] for row in cursor.fetchall()}
-    if "page_number" not in columns:
-        cursor.execute("ALTER TABLE docs ADD COLUMN page_number INTEGER")
-
-    conn.commit()
-    conn.close()
-
-
-def insert_chunks_into_docs(title: str, page_number: int, chunks: List[str]) -> int:
-    """将分块写入 SQLite docs 表（教学/调试用途）。"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    now = datetime.utcnow().isoformat()
-    for chunk in chunks:
-        cursor.execute(
-            "INSERT INTO docs (title, page_number, chunk, created_at) VALUES (?, ?, ?, ?)",
-            (title, page_number, chunk, now),
-        )
-    conn.commit()
-    n = len(chunks)
-    conn.close()
-    return n
-
 
 class HistoryMessage(BaseModel):
     role: str
@@ -161,7 +105,6 @@ app = FastAPI()
 
 @app.on_event("startup")
 def startup_event() -> None:
-    init_db()
     # Azure Application Insights — optional, auto-instruments FastAPI HTTP layer
     ai_conn = os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING", "")
     if ai_conn:
@@ -241,7 +184,7 @@ def create_conversation_if_needed(conversation_id: Optional[str]) -> str:
 SYSTEM_PROMPT = _GRAPH_SYSTEM_PROMPT
 
 
-def build_prompt(message: str, docs: List[Union[sqlite3.Row, dict]]) -> str:
+def build_prompt(message: str, docs: List[dict]) -> str:
     """RAG Pipeline 的 Prompt 拼装阶段，含 CoT 引导。"""
     if not docs:
         return (
