@@ -20,6 +20,22 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REPORTS_DIR = PROJECT_ROOT / "reports"
 
+# ---------------------------------------------------------------------------
+# Cost projection defaults
+# ---------------------------------------------------------------------------
+AVG_INPUT_TOKENS = 2000
+AVG_OUTPUT_TOKENS = 500
+GPT4O_INPUT_PRICE = 2.50  # $/1M tokens
+GPT4O_OUTPUT_PRICE = 10.00  # $/1M tokens
+EMBEDDING_PRICE = 0.13  # $/1M tokens
+AVG_EMBEDDING_TOKENS = 200
+AZURE_SEARCH_MONTHLY = 250.0  # Standard S1
+REDIS_MONTHLY = 55.0  # Basic C1
+CONTAINER_APPS_MONTHLY = 50.0  # 1 vCPU / 2GB
+AVG_QUERIES_PER_USER_PER_DAY = 3
+CACHE_HIT_RATE = 0.60
+WORKING_DAYS_PER_MONTH = 22
+
 
 def parse_stats_csv(filepath: str) -> dict | None:
     """Parse a Locust *_stats.csv and return the Aggregated row as a dict."""
@@ -47,7 +63,149 @@ def extract_user_count(filename: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def build_report(timestamp: str) -> str:
+def _per_request_cost(
+    input_tokens: int,
+    output_tokens: int,
+    embedding_tokens: int,
+    gpt4o_input_price: float,
+    gpt4o_output_price: float,
+    embedding_price: float,
+) -> tuple[float, float, float, float]:
+    """Return (llm_input_cost, llm_output_cost, embed_cost, total)."""
+    llm_in = input_tokens * gpt4o_input_price / 1_000_000
+    llm_out = output_tokens * gpt4o_output_price / 1_000_000
+    embed = embedding_tokens * embedding_price / 1_000_000
+    return llm_in, llm_out, embed, llm_in + llm_out + embed
+
+
+def _monthly_cost(
+    users: int,
+    queries_per_day: int,
+    working_days: int,
+    per_request_cost: float,
+    cache_hit_rate: float,
+) -> tuple[int, int, float]:
+    """Return (monthly_queries, llm_requests, llm_cost)."""
+    monthly_queries = users * queries_per_day * working_days
+    llm_requests = int(monthly_queries * (1 - cache_hit_rate))
+    llm_cost = llm_requests * per_request_cost
+    return monthly_queries, llm_requests, llm_cost
+
+
+def build_cost_projections(cfg: argparse.Namespace) -> str:
+    """Build the Cost Projections section of the report."""
+    lines: list[str] = []
+
+    input_tokens = cfg.avg_input_tokens
+    output_tokens = cfg.avg_output_tokens
+    gpt4o_in = cfg.gpt4o_input_price
+    gpt4o_out = cfg.gpt4o_output_price
+    embed_price = cfg.embedding_price
+    embed_tokens = cfg.avg_embedding_tokens
+    queries_day = cfg.avg_queries_per_user_per_day
+    cache_rate = cfg.cache_hit_rate
+    work_days = cfg.working_days_per_month
+    infra_cost = cfg.azure_search_monthly + cfg.redis_monthly + cfg.container_apps_monthly
+    users_pilot = cfg.users_pilot
+    users_company = cfg.users_company
+
+    llm_in_cost, llm_out_cost, embed_cost, total_per_req = _per_request_cost(
+        input_tokens, output_tokens, embed_tokens, gpt4o_in, gpt4o_out, embed_price
+    )
+
+    lines.append("## Cost Projections")
+    lines.append("")
+
+    # ---- Pricing Assumptions ----
+    lines.append("### Pricing Assumptions")
+    lines.append("| Parameter | Value | Source |")
+    lines.append("|-----------|-------|--------|")
+    lines.append(f"| GPT-4o input | ${gpt4o_in:.2f} / 1M tokens | Azure OpenAI pricing (2024) |")
+    lines.append(f"| GPT-4o output | ${gpt4o_out:.2f} / 1M tokens | Azure OpenAI pricing (2024) |")
+    lines.append(f"| text-embedding-3-large | ${embed_price:.2f} / 1M tokens | Azure OpenAI pricing (2024) |")
+    lines.append(f"| Avg input tokens / request | {input_tokens:,} | Estimated from LangSmith traces |")
+    lines.append(f"| Avg output tokens / request | {output_tokens:,} | Estimated from LangSmith traces |")
+    lines.append(f"| Avg queries / user / day | {queries_day} | Product assumption |")
+    lines.append(f"| Semantic Cache hit rate | {cache_rate:.0%} | Estimated from test runs |")
+    lines.append(f"| Working days / month | {work_days} | Standard |")
+    lines.append("")
+
+    # ---- Per-Request Cost Breakdown ----
+    lines.append("### Per-Request Cost Breakdown")
+    lines.append("| Component | Tokens | Cost |")
+    lines.append("|-----------|--------|------|")
+    lines.append(f"| GPT-4o input | {input_tokens:,} | ${llm_in_cost:.4f} |")
+    lines.append(f"| GPT-4o output | {output_tokens:,} | ${llm_out_cost:.4f} |")
+    lines.append(f"| Embedding (query) | {embed_tokens:,} | ${embed_cost:.4f} |")
+    lines.append(f"| **Total per request** | | **${total_per_req:.4f}** |")
+    lines.append("")
+
+    # ---- Monthly Cost by Scale ----
+    lines.append("### Monthly Cost by Scale")
+    lines.append("")
+
+    scales = [
+        ("HR Pilot", users_pilot),
+        ("Company-wide", users_company),
+    ]
+
+    # Without cache
+    lines.append("#### Without Semantic Cache")
+    lines.append("| Scale | Users | Daily Queries | Monthly Queries | LLM Cost | Infra Cost | Total |")
+    lines.append("|-------|-------|---------------|-----------------|----------|------------|-------|")
+    for label, users in scales:
+        if users <= 0 or queries_day <= 0:
+            continue
+        mq, _, llm_cost = _monthly_cost(users, queries_day, work_days, total_per_req, 0.0)
+        lines.append(
+            f"| {label} | {users:,} | {users * queries_day:,} | {mq:,} "
+            f"| ${llm_cost:,.0f} | ${infra_cost:,.0f} | ${llm_cost + infra_cost:,.0f} |"
+        )
+    lines.append("")
+
+    # With cache
+    lines.append(f"#### With Semantic Cache ({cache_rate:.0%} hit rate)")
+    lines.append("| Scale | Users | LLM Requests | LLM Cost | Cache Savings | Infra Cost | Total |")
+    lines.append("|-------|-------|-------------|----------|---------------|------------|-------|")
+    for label, users in scales:
+        if users <= 0 or queries_day <= 0:
+            continue
+        mq_full, _, llm_full = _monthly_cost(users, queries_day, work_days, total_per_req, 0.0)
+        _, llm_reqs, llm_cached = _monthly_cost(users, queries_day, work_days, total_per_req, cache_rate)
+        savings = llm_full - llm_cached
+        lines.append(
+            f"| {label} | {users:,} | {llm_reqs:,} | ${llm_cached:,.0f} "
+            f"| ${savings:,.0f} ({cache_rate:.0%}) | ${infra_cost:,.0f} "
+            f"| ${llm_cached + infra_cost:,.0f} |"
+        )
+    lines.append("")
+
+    # ---- Cache ROI Analysis ----
+    lines.append("### Cache ROI Analysis")
+    effective_per_req = total_per_req * (1 - cache_rate)
+    _, _, company_savings_amount = _monthly_cost(users_company, queries_day, work_days, total_per_req, 0.0)
+    _, _, company_cached_cost = _monthly_cost(users_company, queries_day, work_days, total_per_req, cache_rate)
+    monthly_savings = company_savings_amount - company_cached_cost
+    lines.append(f"- Cache hit -> cost per request: $0.0000 (embedding only, negligible)")
+    lines.append(f"- Cache miss -> cost per request: ${total_per_req:.4f}")
+    lines.append(f"- At {cache_rate:.0%} hit rate, effective cost per request: ${effective_per_req:.4f}")
+    lines.append(f"- **Cache saves ~${monthly_savings:,.0f}/month at company-wide scale**")
+    lines.append("")
+
+    # ---- Scaling Decision Points ----
+    lines.append("### Scaling Decision Points")
+    lines.append("| Threshold | Action Required | Estimated Cost Impact |")
+    lines.append("|-----------|----------------|----------------------|")
+    lines.append("| > 200 concurrent users | Upgrade Container Apps (2 replicas) | +$50/month |")
+    lines.append("| > 60 QPS on AI Search | Upgrade to Standard S2 or add replicas | +$500/month |")
+    lines.append("| > 100K TPM on GPT-4o | Request higher quota or multi-region deployment | Quota change, no cost |")
+    lines.append("| > 1000 concurrent users | Consider AKS for fine-grained scaling | +$200-500/month |")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def build_report(timestamp: str, cfg: argparse.Namespace | None = None) -> str:
     """Build the full Markdown report."""
     pattern = str(REPORTS_DIR / f"{timestamp}_*_users_stats.csv")
     stat_files = sorted(glob.glob(pattern))
@@ -195,15 +353,45 @@ def build_report(timestamp: str) -> str:
     lines.append("   - Local machine CPU/network may become a bottleneck at high concurrency")
     lines.append("")
 
+    # ---- Cost Projections ----
+    if cfg is not None:
+        lines.append(build_cost_projections(cfg))
+
     return "\n".join(lines)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate load test report from Locust CSVs")
     parser.add_argument("--timestamp", required=True, help="Timestamp prefix of the CSV files")
+
+    # Cost projection overrides
+    parser.add_argument("--avg-input-tokens", type=int, default=AVG_INPUT_TOKENS)
+    parser.add_argument("--avg-output-tokens", type=int, default=AVG_OUTPUT_TOKENS)
+    parser.add_argument("--avg-embedding-tokens", type=int, default=AVG_EMBEDDING_TOKENS)
+    parser.add_argument("--gpt4o-input-price", type=float, default=GPT4O_INPUT_PRICE)
+    parser.add_argument("--gpt4o-output-price", type=float, default=GPT4O_OUTPUT_PRICE)
+    parser.add_argument("--embedding-price", type=float, default=EMBEDDING_PRICE)
+    parser.add_argument("--azure-search-monthly", type=float, default=AZURE_SEARCH_MONTHLY)
+    parser.add_argument("--redis-monthly", type=float, default=REDIS_MONTHLY)
+    parser.add_argument("--container-apps-monthly", type=float, default=CONTAINER_APPS_MONTHLY)
+    parser.add_argument("--avg-queries-per-user-per-day", type=int, default=AVG_QUERIES_PER_USER_PER_DAY)
+    parser.add_argument("--cache-hit-rate", type=float, default=CACHE_HIT_RATE)
+    parser.add_argument("--working-days-per-month", type=int, default=WORKING_DAYS_PER_MONTH)
+    parser.add_argument("--users-pilot", type=int, default=200)
+    parser.add_argument("--users-company", type=int, default=10000)
+
     args = parser.parse_args()
 
-    report = build_report(args.timestamp)
+    # Validate
+    if args.cache_hit_rate < 0 or args.cache_hit_rate > 1:
+        parser.error("--cache-hit-rate must be between 0 and 1")
+    for field in ("avg_input_tokens", "avg_output_tokens", "avg_embedding_tokens",
+                  "avg_queries_per_user_per_day", "working_days_per_month",
+                  "users_pilot", "users_company"):
+        if getattr(args, field) <= 0:
+            parser.error(f"--{field.replace('_', '-')} must be a positive integer")
+
+    report = build_report(args.timestamp, cfg=args)
 
     output_path = REPORTS_DIR / f"loadtest_report_{args.timestamp}.md"
     output_path.write_text(report, encoding="utf-8")
